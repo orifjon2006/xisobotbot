@@ -1,4 +1,6 @@
 aiogram>=3.26.0
 aiosqlite>=0.20.0
-groq>=0.18.0
+groq>=0.31.0
 openpyxl>=3.1.5
+python-dotenv>=1.0.1
+tzdata>=2025.2
