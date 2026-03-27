@@ -1,10 +1,11 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import tempfile
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -12,14 +13,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
-    CallbackQuery,
     FSInputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -39,7 +36,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
 DB_PATH = os.getenv("DB_PATH", "finance_bot.db").strip()
-TIMEZONE_NAME = os.getenv("BOT_TIMEZONE", os.getenv("TIMEZONE", "Asia/Tashkent")).strip()
+TIMEZONE_NAME = os.getenv("BOT_TIMEZONE", "Asia/Tashkent").strip()
 DEFAULT_USD_RATE = float(os.getenv("DEFAULT_USD_RATE", "12750") or 12750)
 ADMIN_IDS = {
     int(part.strip())
@@ -52,91 +49,85 @@ try:
 except ZoneInfoNotFoundError:
     TZ = timezone(timedelta(hours=5))
 
-GROQ_CLIENT: Optional[AsyncGroq] = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
-logger = logging.getLogger("finance_bot")
+router = Router()
+logger = logging.getLogger("finance-bot")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-router = Router()
 
-INCOME = "income"
-EXPENSE = "expense"
-PENDING = "pending"
-SAVED = "saved"
-CANCELED = "canceled"
-UNDONE = "undone"
+BUTTON_TODAY = "📊 Bugun"
+BUTTON_MONTH = "🗓 Oy"
+BUTTON_BALANCE = "💰 Balans"
+BUTTON_EXPORT = "📤 Excel"
+BUTTON_RECORDS = "🧾 So‘nggi 10"
+BUTTON_RATE = "⚙️ Kurs"
+BUTTON_HELP = "ℹ️ Yordam"
 
-# =========================================================
-# UI
-# =========================================================
-BTN_TODAY = "📊 Bugun"
-BTN_MONTH = "🗓 Oy"
-BTN_BALANCE = "💰 Balans"
-BTN_RECORDS = "🧾 So‘nggi"
-BTN_EXPORT = "📤 Excel"
-BTN_UNDO = "↩️ Oxirgi amalni bekor qilish"
-BTN_HELP = "ℹ️ Yordam"
-
-MAIN_KB = ReplyKeyboardMarkup(
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_TODAY), KeyboardButton(text=BTN_MONTH)],
-        [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_RECORDS)],
-        [KeyboardButton(text=BTN_EXPORT), KeyboardButton(text=BTN_UNDO)],
-        [KeyboardButton(text=BTN_HELP)],
+        [KeyboardButton(text=BUTTON_TODAY), KeyboardButton(text=BUTTON_MONTH)],
+        [KeyboardButton(text=BUTTON_BALANCE), KeyboardButton(text=BUTTON_EXPORT)],
+        [KeyboardButton(text=BUTTON_RECORDS), KeyboardButton(text=BUTTON_RATE)],
+        [KeyboardButton(text=BUTTON_HELP)],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Masalan: +250$ klient to‘lovi yoki Telegram log matni",
+    input_field_placeholder="Log yoki summali matn yuboring…",
 )
 
 HELP_TEXT = (
-    "Assalomu alaykum. Bu bot summalarni aniq qoidalar bilan hisoblaydi.\n\n"
-    "Qoidalar:\n"
+    "Bu bot summalarni juda sodda qoida bilan hisoblaydi:\n"
     "• '+' bilan boshlangan summa = kirim\n"
-    "• '+' bo‘lmasa summa = chiqim\n"
+    "• qolgan summa = chiqim\n"
     "• 'mln' = 1 000 000\n"
-    "• 'ming' yoki 'k' = 1 000\n"
-    "• '$' yoki 'usd' bo‘lsa UZS ga kurs bo‘yicha aylantiriladi\n"
-    "• Avval preview chiqadi, keyin 'Saqlash' ni bossangiz bazaga yoziladi\n"
-    "• /undo oxirgi saqlangan batchni bekor qiladi\n\n"
+    "• 'ming' = 1 000\n"
+    "• '$' yoki 'usd' bo‘lsa, joriy kurs bo‘yicha UZS ga aylantiriladi\n\n"
     "Misollar:\n"
-    "+250$ azam aka to‘lovi\n"
+    "+250$ klient to‘lovi\n"
     "100 ming dostavka\n"
-    "+517 ming labo berari\n"
-    "3,9 mln xizmat predoplata\n"
-    "+500$ +350 ming 100 ming dokument\n\n"
+    "+517ming azam aka\n"
+    "3,9 mln resor xizmat\n"
+    "500$ +350 ming -100 ming 120 ming dokument\n\n"
     "Buyruqlar:\n"
     "/start — menyu\n"
     "/help — yordam\n"
-    "/stats [today|week|month|all|YYYY-MM|YYYY-MM-DD] — statistika\n"
-    "/balance [period] — balans\n"
+    "/stats [today|week|month|YYYY-MM|YYYY-MM-DD] — statistika\n"
+    "/balance [today|week|month|YYYY-MM|YYYY-MM-DD] — balans\n"
     "/records [son] — oxirgi yozuvlar\n"
-    "/export [period] — Excel hisobot\n"
+    "/export [today|week|month|YYYY-MM|YYYY-MM-DD|all] — Excel\n"
     "/rate [qiymat] — USD kursi\n"
-    "/undo — oxirgi amalni bekor qilish\n"
-    "/delete <id> — bitta yozuvni o‘chirish\n"
+    "/delete <id> — yozuvni o‘chirish\n"
     "/categories [period] — kategoriya kesimi"
-)
-
-
-# =========================================================
-# REGEX / PARSING
-# =========================================================
-TELEGRAM_LINE_RE = re.compile(
-    r"^\[(?P<dt>\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})\]\s*(?P<author>[^:]+):\s*(?P<body>.+)$"
 )
 
 AMOUNT_RE = re.compile(
     r"(?<![\w/])"
     r"(?P<sign>[+-]?)\s*"
-    r"(?P<number>(?:\d{1,3}(?:[\s.,]\d{3})+|\d+)(?:[.,]\d+)?)"
-    r"\s*(?P<mult>mln\.?|million|mlyon|млн\.?|ming|k|thousand|тыс\.?)?"
-    r"\s*(?P<currency>\$|usd|dollar|dollars|доллар|uzs|sum|som|сум|so['ʻ’]?m|so‘m)?",
+    r"(?P<number>\d+(?:[.,]\d{1,3})*(?:[.,]\d+)?)"
+    r"\s*(?P<mult>mln\.?|million|mlyon|млн\.?|ming|mingta|thousand|тыс\.?|k)?"
+    r"\s*(?P<currency>\$|usd|dollar|dollars|доллар|uzs|sum|сум|so['ʻ’]?m|som)?",
     re.IGNORECASE,
 )
 
-NAME_HINT_RE = re.compile(r"\b([A-ZА-ЯЁ][a-zа-яё]+(?:\s+[A-ZА-ЯЁ][a-zа-яё]+){0,2})\b")
+TELEGRAM_LINE_RE = re.compile(
+    r"^\[(?P<dt>\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})\]\s*(?P<author>[^:]+):\s*(?P<body>.+)$"
+)
+
+INCOME = "income"
+EXPENSE = "expense"
+
+AI_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "category": {"type": "string"},
+        "counterparty": {"type": "string"},
+        "clean_note": {"type": "string"},
+    },
+    "required": ["category", "counterparty", "clean_note"],
+    "additionalProperties": False,
+}
+
+GROQ_CLIENT: Optional[AsyncGroq] = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 
 # =========================================================
@@ -152,72 +143,35 @@ class ParsedLine:
 
 
 @dataclass
-class ParsedTransaction:
+class MoneyHit:
+    raw_token: str
+    sign: str
     direction: str
     currency: str
     amount_original: float
     amount_uzs: int
     amount_text: str
-    note: str
-    category: str
-    counterparty: str
-    raw_line: str
-    line_index: int
-    author: str
-    tx_at: str
-    usd_rate: float
+    start: int
+    end: int
 
 
 # =========================================================
-# TIME / FORMAT HELPERS
+# GENERAL HELPERS
 # =========================================================
 def now_local() -> datetime:
     return datetime.now(TZ)
 
 
-def parse_telegram_dt(value: str) -> datetime:
-    return datetime.strptime(value, "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
+def to_iso(dt: datetime) -> str:
+    return dt.astimezone(TZ).isoformat()
+
+
+def from_iso(text: str) -> datetime:
+    return datetime.fromisoformat(text).astimezone(TZ)
 
 
 def start_of_day(dt: datetime) -> datetime:
     return dt.astimezone(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-def parse_period(arg: Optional[str]) -> tuple[Optional[datetime], Optional[datetime], str]:
-    raw = (arg or "month").strip().lower()
-    base = now_local()
-
-    if raw == "all":
-        return None, None, "all"
-    if raw == "today":
-        start = start_of_day(base)
-        return start, start + timedelta(days=1), "today"
-    if raw == "week":
-        start = start_of_day(base - timedelta(days=base.weekday()))
-        return start, start + timedelta(days=7), "week"
-    if raw == "month":
-        start = start_of_day(base.replace(day=1))
-        if start.month == 12:
-            end = start.replace(year=start.year + 1, month=1)
-        else:
-            end = start.replace(month=start.month + 1)
-        return start, end, "month"
-
-    if re.fullmatch(r"\d{4}-\d{2}", raw):
-        year, month = map(int, raw.split("-"))
-        start = datetime(year, month, 1, tzinfo=TZ)
-        if month == 12:
-            end = datetime(year + 1, 1, 1, tzinfo=TZ)
-        else:
-            end = datetime(year, month + 1, 1, tzinfo=TZ)
-        return start, end, raw
-
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
-        year, month, day = map(int, raw.split("-"))
-        start = datetime(year, month, day, tzinfo=TZ)
-        return start, start + timedelta(days=1), raw
-
-    return parse_period("month")
 
 
 def safe_author(message: Message) -> str:
@@ -234,536 +188,440 @@ def money_fmt_uzs(value: float | int) -> str:
 
 
 def money_fmt_usd(value: float) -> str:
-    if abs(value - int(value)) < 1e-9:
-        return "$" + f"{int(value):,}".replace(",", " ")
-    return "$" + f"{value:,.2f}".replace(",", " ")
+    if float(value).is_integer():
+        return f"${int(value):,}".replace(",", " ")
+    return f"${value:,.2f}".replace(",", " ")
 
 
-def dt_fmt(dt: datetime) -> str:
-    return dt.astimezone(TZ).strftime("%d.%m.%Y %H:%M")
+def balance_emoji(amount: int) -> str:
+    return "🟢" if amount >= 0 else "🔴"
 
 
-def iso_now() -> str:
-    return now_local().isoformat()
+def parse_telegram_dt(value: str) -> datetime:
+    naive = datetime.strptime(value, "%d.%m.%Y %H:%M")
+    return naive.replace(tzinfo=TZ)
 
 
-def parse_iso(value: str) -> datetime:
-    return datetime.fromisoformat(value).astimezone(TZ)
+def parse_period(arg: Optional[str]) -> tuple[Optional[datetime], Optional[datetime], str]:
+    arg = (arg or "month").strip().lower()
+    base = now_local()
+
+    if arg == "all":
+        return None, None, "all"
+
+    if arg == "today":
+        start = start_of_day(base)
+        end = start + timedelta(days=1)
+        return start, end, "today"
+
+    if arg == "week":
+        start = start_of_day(base - timedelta(days=base.weekday()))
+        end = start + timedelta(days=7)
+        return start, end, "week"
+
+    if arg == "month":
+        start = base.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1)
+        else:
+            end = start.replace(month=start.month + 1)
+        return start, end, start.strftime("%Y-%m")
+
+    if re.fullmatch(r"\d{4}-\d{2}", arg):
+        start = datetime.strptime(arg + "-01", "%Y-%m-%d").replace(tzinfo=TZ)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1)
+        else:
+            end = start.replace(month=start.month + 1)
+        return start, end, arg
+
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", arg):
+        start = datetime.strptime(arg, "%Y-%m-%d").replace(tzinfo=TZ)
+        return start, start + timedelta(days=1), arg
+
+    return parse_period("month")
 
 
-def normalize_spaces(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip(" ,;-—")
+def is_allowed(user_id: int) -> bool:
+    if not ADMIN_IDS:
+        return True
+    return user_id in ADMIN_IDS
+
+
+async def guard(message: Message) -> bool:
+    user_id = message.from_user.id if message.from_user else 0
+    if not is_allowed(user_id):
+        await message.answer("Sizga bu botdan foydalanish uchun ruxsat berilmagan.")
+        return False
+    return True
 
 
 # =========================================================
-# PARSER CORE
+# PARSING
 # =========================================================
-def parse_decimalish(raw: str, multiplier_hint: str) -> float:
-    text = raw.replace("\u00A0", " ").replace(" ", "")
-    sep_count = text.count(",") + text.count(".")
-    multiplier_hint = multiplier_hint.lower()
-
-    if sep_count == 0:
-        return float(text)
-
-    if sep_count == 1:
-        sep = "," if "," in text else "."
-        left, right = text.split(sep, 1)
-        if len(right) in (1, 2):
-            return float(left + "." + right)
-        if len(right) == 3 and multiplier_hint.startswith(("mln", "million", "mlyon", "млн")):
-            return float(left + "." + right)
-        return float(left + right)
-
-    last_comma = text.rfind(",")
-    last_dot = text.rfind(".")
-    last_idx = max(last_comma, last_dot)
-    right = text[last_idx + 1 :]
-    if len(right) in (1, 2):
-        integer_part = re.sub(r"[,.]", "", text[:last_idx])
-        return float(integer_part + "." + right)
-    return float(re.sub(r"[,.]", "", text))
+def normalize_body(body: str) -> str:
+    text = body.replace("\u00a0", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
-def normalize_currency(currency_raw: str) -> str:
-    value = (currency_raw or "").strip().lower()
+def extract_lines(text: str, fallback_author: str) -> list[ParsedLine]:
+    results: list[ParsedLine] = []
+    raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    for idx, raw_line in enumerate(raw_lines, start=1):
+        match = TELEGRAM_LINE_RE.match(raw_line)
+        if match:
+            tx_dt = parse_telegram_dt(match.group("dt"))
+            author = match.group("author").strip()
+            body = normalize_body(match.group("body"))
+        else:
+            tx_dt = now_local()
+            author = fallback_author
+            body = normalize_body(raw_line)
+        results.append(
+            ParsedLine(
+                raw_line=raw_line,
+                body=body,
+                author=author,
+                tx_dt=tx_dt,
+                line_index=idx,
+            )
+        )
+    return results
+
+
+def _to_number(token: str, multiplier: str | None) -> float:
+    cleaned = token.replace(" ", "")
+    mult = (multiplier or "").lower()
+
+    if mult in {"mln", "mln.", "million", "mlyon", "млн", "млн."}:
+        cleaned = cleaned.replace(",", ".")
+        value = float(cleaned)
+        return value * 1_000_000
+
+    if mult in {"ming", "mingta", "thousand", "тыс", "тыс.", "k"}:
+        cleaned = cleaned.replace(",", ".")
+        value = float(cleaned)
+        return value * 1_000
+
+    if "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(",", "")
+    elif cleaned.count(",") == 1 and "." not in cleaned:
+        left, right = cleaned.split(",")
+        if len(right) == 3:
+            cleaned = left + right
+        else:
+            cleaned = left + "." + right
+    elif cleaned.count(".") == 1:
+        left, right = cleaned.split(".")
+        if len(right) == 3:
+            cleaned = left + right
+
+    value = float(cleaned)
+    return value
+
+
+def _currency_kind(currency: str | None) -> str:
+    value = (currency or "").lower().strip()
     if value in {"$", "usd", "dollar", "dollars", "доллар"}:
         return "USD"
     return "UZS"
 
 
-def multiplier_value(mult_raw: str) -> int:
-    value = (mult_raw or "").strip().lower().replace(".", "")
-    if value in {"mln", "million", "mlyon", "млн"}:
-        return 1_000_000
-    if value in {"ming", "k", "thousand", "тыс"}:
-        return 1_000
-    return 1
+def _should_accept_hit(sign: str, number: str, mult: str | None, currency: str | None) -> bool:
+    if sign in {"+", "-"}:
+        return True
+    if mult:
+        return True
+    if currency:
+        return True
+    digits_only = re.sub(r"\D", "", number)
+    return len(digits_only) >= 4
 
 
-def detect_direction(sign: str) -> str:
-    return INCOME if sign == "+" else EXPENSE
+def parse_money_hits(body: str, usd_rate: float) -> list[MoneyHit]:
+    hits: list[MoneyHit] = []
 
-
-def extract_lines(text: str, fallback_author: str, fallback_dt: datetime) -> list[ParsedLine]:
-    lines: list[ParsedLine] = []
-    for idx, raw_line in enumerate([part.strip() for part in text.splitlines() if part.strip()], start=1):
-        m = TELEGRAM_LINE_RE.match(raw_line)
-        if m:
-            lines.append(
-                ParsedLine(
-                    raw_line=raw_line,
-                    body=m.group("body").strip(),
-                    author=m.group("author").strip(),
-                    tx_dt=parse_telegram_dt(m.group("dt")),
-                    line_index=idx,
-                )
-            )
-        else:
-            lines.append(
-                ParsedLine(
-                    raw_line=raw_line,
-                    body=raw_line,
-                    author=fallback_author,
-                    tx_dt=fallback_dt,
-                    line_index=idx,
-                )
-            )
-    return lines
-
-
-def heuristic_category(note: str) -> str:
-    text = note.lower()
-    pairs = [
-        (["dostav", "delivery", "доставка"], "Dostavka"),
-        (["avans", "predoplata", "oldindan"], "Avans"),
-        (["dokument", "hujjat"], "Dokument"),
-        (["metan", "gaz", "benzin", "yoqilg"], "Yoqilg‘i"),
-        (["labo", "tracker", "nikel", "resor"], "Avto xizmat"),
-        (["xizmat", "service", "ustanovka", "ремонт"], "Xizmat"),
-        (["oylik", "maosh", "zarplata"], "Ish haqi"),
-        (["ijara", "arenda"], "Ijara"),
-        (["temir", "material", "zapchast"], "Material"),
-        (["qarz", "debt"], "Qarz"),
-    ]
-    for keys, label in pairs:
-        if any(key in text for key in keys):
-            return label
-    return "Boshqa"
-
-
-def heuristic_counterparty(note: str) -> str:
-    match = NAME_HINT_RE.search(note)
-    if match:
-        return match.group(1)
-    low = note.lower()
-    for token in ["aka", "dost", "mijoz", "klient", "ustaga"]:
-        pos = low.find(token)
-        if pos > 0:
-            left = note[: pos + len(token)]
-            words = left.split()
-            return " ".join(words[-3:])
-    return ""
-
-
-async def enrich_note_with_ai(note: str) -> tuple[str, str, str]:
-    clean_note = normalize_spaces(note)
-    category = heuristic_category(clean_note)
-    counterparty = heuristic_counterparty(clean_note)
-
-    if not GROQ_CLIENT or not clean_note:
-        return clean_note, category, counterparty
-
-    try:
-        completion = await asyncio.wait_for(
-            GROQ_CLIENT.chat.completions.create(
-                model=GROQ_MODEL,
-                temperature=0,
-                response_format={"type": "json_object"},
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You extract accounting metadata. Return compact JSON with keys: "
-                            "clean_note, category, counterparty. Keep Uzbek-friendly labels."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "text": clean_note,
-                                "rules": {
-                                    "category": "Short label like Avans, Xizmat, Dostavka, Yoqilg‘i, Dokument, Qarz, Material, Boshqa",
-                                    "counterparty": "Person or company if present, otherwise empty string",
-                                },
-                            },
-                            ensure_ascii=False,
-                        ),
-                    },
-                ],
-            ),
-            timeout=20,
-        )
-        raw = completion.choices[0].message.content or "{}"
-        data = json.loads(raw)
-        clean_note = normalize_spaces(data.get("clean_note") or clean_note)
-        category = normalize_spaces(data.get("category") or category)[:60] or category
-        counterparty = normalize_spaces(data.get("counterparty") or counterparty)[:80]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Groq enrichment fallback ishladi: %s", exc)
-
-    return clean_note, category, counterparty
-
-
-def remove_amount_tokens(body: str) -> str:
-    without_tokens = AMOUNT_RE.sub(" ", body)
-    without_stray = re.sub(r"\s*[+\-]\s*", " ", without_tokens)
-    return normalize_spaces(without_stray)
-
-
-def parse_line_hits(body: str, usd_rate: float) -> list[dict[str, Any]]:
-    hits: list[dict[str, Any]] = []
     for match in AMOUNT_RE.finditer(body):
-        number_raw = match.group("number") or ""
-        currency_raw = match.group("currency") or ""
-        mult_raw = match.group("mult") or ""
         sign = (match.group("sign") or "").strip()
-        full_text = normalize_spaces(match.group(0) or "")
+        number = (match.group("number") or "").strip()
+        multiplier = (match.group("mult") or "").strip() or None
+        currency_token = (match.group("currency") or "").strip() or None
+        raw_token = match.group(0).strip()
 
-        # reject weak matches like bare 018 or 2026 without currency/multiplier/sign and with small/noisy token
-        if not (currency_raw or mult_raw or sign or re.search(r"\s", full_text)):
-            if number_raw.startswith("0") and len(re.sub(r"\D", "", number_raw)) > 1:
-                continue
-            if len(re.sub(r"\D", "", number_raw)) <= 2:
-                continue
+        if not number:
+            continue
+        if not _should_accept_hit(sign, number, multiplier, currency_token):
+            continue
 
-        amount = parse_decimalish(number_raw, mult_raw)
-        amount *= multiplier_value(mult_raw)
-        currency = normalize_currency(currency_raw)
-        direction = detect_direction(sign)
-        amount_uzs = int(round(amount * usd_rate)) if currency == "USD" else int(round(amount))
+        try:
+            value = _to_number(number, multiplier)
+        except ValueError:
+            continue
+
+        currency = _currency_kind(currency_token)
+        direction = INCOME if sign == "+" else EXPENSE
+        amount_original = abs(value)
+        if currency == "USD":
+            amount_uzs = int(round(amount_original * usd_rate))
+            amount_text = money_fmt_usd(amount_original)
+        else:
+            amount_uzs = int(round(amount_original))
+            amount_text = money_fmt_uzs(amount_original)
 
         hits.append(
-            {
-                "direction": direction,
-                "currency": currency,
-                "amount_original": float(amount),
-                "amount_uzs": amount_uzs,
-                "amount_text": full_text,
-            }
+            MoneyHit(
+                raw_token=raw_token,
+                sign=sign,
+                direction=direction,
+                currency=currency,
+                amount_original=amount_original,
+                amount_uzs=amount_uzs,
+                amount_text=amount_text,
+                start=match.start(),
+                end=match.end(),
+            )
         )
+
     return hits
 
 
-async def build_transactions_from_text(text: str, author: str, base_dt: datetime, usd_rate: float) -> list[ParsedTransaction]:
-    lines = extract_lines(text, author, base_dt)
-    transactions: list[ParsedTransaction] = []
-
-    for line in lines:
-        hits = parse_line_hits(line.body, usd_rate)
-        if not hits:
-            continue
-        stripped_note = remove_amount_tokens(line.body)
-        clean_note, category, counterparty = await enrich_note_with_ai(stripped_note)
-        for hit in hits:
-            transactions.append(
-                ParsedTransaction(
-                    direction=hit["direction"],
-                    currency=hit["currency"],
-                    amount_original=hit["amount_original"],
-                    amount_uzs=hit["amount_uzs"],
-                    amount_text=hit["amount_text"],
-                    note=clean_note or stripped_note or line.body,
-                    category=category,
-                    counterparty=counterparty,
-                    raw_line=line.raw_line,
-                    line_index=line.line_index,
-                    author=line.author,
-                    tx_at=line.tx_dt.isoformat(),
-                    usd_rate=usd_rate,
-                )
-            )
-    return transactions
+def strip_amount_tokens(body: str, hits: list[MoneyHit]) -> str:
+    text = body
+    for hit in sorted(hits, key=lambda item: item.start, reverse=True):
+        text = text[: hit.start] + " " + text[hit.end :]
+    text = re.sub(r"\s+", " ", text).strip(" ,.;:-")
+    return text
 
 
-# =========================================================
-# DB
-# =========================================================
-async def db_connect() -> aiosqlite.Connection:
-    conn = await aiosqlite.connect(DB_PATH)
-    conn.row_factory = aiosqlite.Row
-    await conn.execute("PRAGMA journal_mode=WAL")
-    await conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+def fallback_counterparty(text: str) -> str:
+    patterns = [
+        r"\b([A-ZА-ЯЁЎҚҒҲ][a-zа-яёўқғҳ]+\s+(?:aka|aka\.?|akaга|аka|akaга))\b",
+        r"\b([A-ZА-ЯЁЎҚҒҲ][a-zа-яёўқғҳ]+\s+[A-ZА-ЯЁЎҚҒҲ][a-zа-яёўқғҳ]+)\b",
+        r"\b([A-ZА-ЯЁЎҚҒҲ][a-zа-яёўқғҳ]+\s+aka)\b",
+    ]
+    for pattern in patterns:
+        found = re.search(pattern, text, re.IGNORECASE)
+        if found:
+            return found.group(1).strip()
+    return ""
 
 
-async def init_db() -> None:
-    conn = await db_connect()
+def fallback_category(text: str) -> str:
+    low = text.lower()
+    mapping = {
+        "dostav": "Dostavka",
+        "deliver": "Dostavka",
+        "temir": "Material",
+        "nikel": "Material",
+        "metan": "Yoqilg‘i",
+        "gaz": "Yoqilg‘i",
+        "benzin": "Yoqilg‘i",
+        "resor": "Xizmat",
+        "xizmat": "Xizmat",
+        "predopl": "Avans",
+        "avans": "Avans",
+        "dokument": "Dokument",
+        "dok": "Dokument",
+        "labo": "Avto",
+        "mashina": "Avto",
+        "chek": "Hisobot",
+        "to‘lov": "Savdo",
+        "tolov": "Savdo",
+        "olindi": "Savdo",
+        "berdim": "Xarajat",
+    }
+    for key, value in mapping.items():
+        if key in low:
+            return value
+    return "Boshqa"
+
+
+async def enrich_metadata(body: str, hits: list[MoneyHit]) -> dict[str, str]:
+    clean_note = strip_amount_tokens(body, hits) or body
+    fallback = {
+        "category": fallback_category(clean_note),
+        "counterparty": fallback_counterparty(clean_note),
+        "clean_note": clean_note,
+    }
+
+    if not GROQ_CLIENT:
+        return fallback
+
     try:
-        await conn.executescript(
+        compact_hits = [
+            {
+                "direction": hit.direction,
+                "currency": hit.currency,
+                "amount_text": hit.amount_text,
+                "raw_token": hit.raw_token,
+            }
+            for hit in hits
+        ]
+        prompt = (
+            "Quyidagi moliyaviy yozuv uchun faqat metadata chiqaring. "
+            "Summalarni va yo‘nalishni hisoblamang, ular allaqachon aniqlangan. "
+            "Kategoriya qisqa bo‘lsin. Counterparty topilmasa bo‘sh string qaytaring.\n\n"
+            f"Matn: {body}\n"
+            f"Aniqlangan summalar: {json.dumps(compact_hits, ensure_ascii=False)}"
+        )
+        response = await GROQ_CLIENT.chat.completions.create(
+            model=GROQ_MODEL,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You extract metadata for finance records in Uzbek/Russian. Return only valid JSON.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "finance_metadata",
+                    "strict": True,
+                    "schema": AI_SCHEMA,
+                },
+            },
+        )
+        content = response.choices[0].message.content or "{}"
+        data = json.loads(content)
+        return {
+            "category": (data.get("category") or fallback["category"]).strip()[:60],
+            "counterparty": (data.get("counterparty") or fallback["counterparty"]).strip()[:80],
+            "clean_note": (data.get("clean_note") or fallback["clean_note"]).strip()[:300],
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Groq metadata fallback ishladi: %s", exc)
+        return fallback
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+async def init_db() -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA foreign_keys=ON;")
+
+        await db.execute(
             """
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
-            );
+            )
+            """
+        )
 
-            CREATE TABLE IF NOT EXISTS batches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                source_message_id INTEGER,
-                user_id INTEGER,
-                author_name TEXT,
-                status TEXT NOT NULL,
-                raw_text TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                confirmed_at TEXT,
-                canceled_at TEXT,
-                undone_at TEXT,
-                preview_text TEXT
-            );
-
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry_hash TEXT UNIQUE NOT NULL,
                 chat_id INTEGER NOT NULL,
-                batch_id INTEGER NOT NULL,
-                source_message_id INTEGER,
+                message_id INTEGER,
                 user_id INTEGER,
-                author_name TEXT,
-                direction TEXT NOT NULL,
-                currency TEXT NOT NULL,
-                amount_original REAL NOT NULL,
-                usd_rate REAL NOT NULL,
-                amount_uzs INTEGER NOT NULL,
-                amount_text TEXT NOT NULL,
-                category TEXT,
-                counterparty TEXT,
-                note TEXT,
-                raw_line TEXT,
-                line_index INTEGER,
-                tx_at TEXT NOT NULL,
+                note_date TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                is_deleted INTEGER NOT NULL DEFAULT 0,
-                deleted_at TEXT,
-                FOREIGN KEY(batch_id) REFERENCES batches(id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_transactions_chat_txat
-                ON transactions(chat_id, tx_at);
-            CREATE INDEX IF NOT EXISTS idx_transactions_batch
-                ON transactions(batch_id);
-            CREATE INDEX IF NOT EXISTS idx_batches_chat_status
-                ON batches(chat_id, status, created_at);
+                author TEXT NOT NULL,
+                original_text TEXT NOT NULL,
+                clean_note TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK(direction IN ('income', 'expense')),
+                category TEXT NOT NULL,
+                counterparty TEXT NOT NULL,
+                currency TEXT NOT NULL CHECK(currency IN ('UZS', 'USD')),
+                amount_original REAL NOT NULL,
+                amount_uzs INTEGER NOT NULL,
+                usd_rate REAL NOT NULL,
+                parser TEXT NOT NULL
+            )
             """
         )
-        await conn.execute(
-            """
-            INSERT INTO settings(key, value, updated_at)
-            VALUES('usd_rate', ?, ?)
-            ON CONFLICT(key) DO NOTHING
-            """,
-            (str(DEFAULT_USD_RATE), iso_now()),
-        )
-        await conn.commit()
-    finally:
-        await conn.close()
-
-
-async def get_setting(key: str, default: str = "") -> str:
-    conn = await db_connect()
-    try:
-        async with conn.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cur:
-            row = await cur.fetchone()
-            return row["value"] if row else default
-    finally:
-        await conn.close()
+        await db.commit()
 
 
 async def set_setting(key: str, value: str) -> None:
-    conn = await db_connect()
-    try:
-        await conn.execute(
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
             """
             INSERT INTO settings(key, value, updated_at)
-            VALUES(?, ?, ?)
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
             """,
-            (key, value, iso_now()),
+            (key, value, to_iso(now_local())),
         )
-        await conn.commit()
-    finally:
-        await conn.close()
+        await db.commit()
+
+
+async def get_setting(key: str) -> Optional[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
 
 async def get_usd_rate() -> float:
-    raw = await get_setting("usd_rate", str(DEFAULT_USD_RATE))
+    stored = await get_setting("usd_rate")
+    if stored is None:
+        return DEFAULT_USD_RATE
     try:
-        value = float(raw)
-        if value > 0:
-            return value
+        return float(stored)
     except ValueError:
-        pass
-    return DEFAULT_USD_RATE
+        return DEFAULT_USD_RATE
 
 
-async def create_pending_batch(
+async def save_transactions(
     chat_id: int,
-    source_message_id: int,
-    user_id: Optional[int],
-    author_name: str,
-    raw_text: str,
-    transactions: list[ParsedTransaction],
-    preview_text: str,
+    message_id: int | None,
+    user_id: int | None,
+    parsed_line: ParsedLine,
+    hits: list[MoneyHit],
+    meta: dict[str, str],
+    usd_rate: float,
 ) -> int:
-    payload = json.dumps([asdict(item) for item in transactions], ensure_ascii=False)
-    conn = await db_connect()
-    try:
-        cur = await conn.execute(
-            """
-            INSERT INTO batches(
-                chat_id, source_message_id, user_id, author_name, status,
-                raw_text, payload_json, created_at, preview_text
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                chat_id,
-                source_message_id,
-                user_id,
-                author_name,
-                PENDING,
-                raw_text,
-                payload,
-                iso_now(),
-                preview_text,
-            ),
-        )
-        await conn.commit()
-        return int(cur.lastrowid)
-    finally:
-        await conn.close()
-
-
-async def get_batch(batch_id: int) -> Optional[aiosqlite.Row]:
-    conn = await db_connect()
-    try:
-        async with conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)) as cur:
-            return await cur.fetchone()
-    finally:
-        await conn.close()
-
-
-async def save_batch(batch_id: int) -> tuple[bool, str]:
-    conn = await db_connect()
-    try:
-        await conn.execute("BEGIN")
-        async with conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)) as cur:
-            batch = await cur.fetchone()
-        if not batch:
-            await conn.rollback()
-            return False, "Batch topilmadi."
-        if batch["status"] != PENDING:
-            await conn.rollback()
-            return False, "Bu batch allaqachon qayta ishlangan."
-
-        payload = json.loads(batch["payload_json"])
-        created_at = iso_now()
-        for item in payload:
-            await conn.execute(
+    inserted = 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        for hit in hits:
+            raw_hash = (
+                f"{chat_id}|{message_id}|{parsed_line.line_index}|{parsed_line.raw_line}|"
+                f"{hit.start}|{hit.direction}|{hit.currency}|{hit.amount_original}"
+            )
+            entry_hash = hashlib.sha1(raw_hash.encode("utf-8")).hexdigest()
+            cursor = await db.execute(
                 """
-                INSERT INTO transactions(
-                    chat_id, batch_id, source_message_id, user_id, author_name,
-                    direction, currency, amount_original, usd_rate, amount_uzs,
-                    amount_text, category, counterparty, note, raw_line,
-                    line_index, tx_at, created_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO transactions (
+                    entry_hash, chat_id, message_id, user_id, note_date, created_at, author,
+                    original_text, clean_note, direction, category, counterparty,
+                    currency, amount_original, amount_uzs, usd_rate, parser
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    batch["chat_id"],
-                    batch_id,
-                    batch["source_message_id"],
-                    batch["user_id"],
-                    item["author"],
-                    item["direction"],
-                    item["currency"],
-                    item["amount_original"],
-                    item["usd_rate"],
-                    item["amount_uzs"],
-                    item["amount_text"],
-                    item.get("category") or "Boshqa",
-                    item.get("counterparty") or "",
-                    item.get("note") or "",
-                    item.get("raw_line") or "",
-                    item.get("line_index") or 0,
-                    item["tx_at"],
-                    created_at,
+                    entry_hash,
+                    chat_id,
+                    message_id,
+                    user_id,
+                    to_iso(parsed_line.tx_dt),
+                    to_iso(now_local()),
+                    parsed_line.author,
+                    parsed_line.raw_line,
+                    meta.get("clean_note", parsed_line.body),
+                    hit.direction,
+                    meta.get("category", "Boshqa"),
+                    meta.get("counterparty", ""),
+                    hit.currency,
+                    hit.amount_original,
+                    hit.amount_uzs,
+                    usd_rate,
+                    "deterministic+groq" if GROQ_CLIENT else "deterministic",
                 ),
             )
-        await conn.execute(
-            "UPDATE batches SET status = ?, confirmed_at = ? WHERE id = ?",
-            (SAVED, created_at, batch_id),
-        )
-        await conn.commit()
-        return True, "Saqlandi"
-    except Exception as exc:  # noqa: BLE001
-        await conn.rollback()
-        logger.exception("save_batch xato")
-        return False, f"Saqlashda xato: {exc}"
-    finally:
-        await conn.close()
-
-
-async def cancel_batch(batch_id: int) -> tuple[bool, str]:
-    conn = await db_connect()
-    try:
-        cur = await conn.execute(
-            "UPDATE batches SET status = ?, canceled_at = ? WHERE id = ? AND status = ?",
-            (CANCELED, iso_now(), batch_id, PENDING),
-        )
-        await conn.commit()
-        if cur.rowcount:
-            return True, "Bekor qilindi"
-        return False, "Batch topilmadi yoki allaqachon saqlangan."
-    finally:
-        await conn.close()
-
-
-async def undo_last_batch(chat_id: int) -> tuple[bool, str, Optional[int]]:
-    conn = await db_connect()
-    try:
-        await conn.execute("BEGIN")
-        async with conn.execute(
-            """
-            SELECT id FROM batches
-            WHERE chat_id = ? AND status = ?
-            ORDER BY confirmed_at DESC, id DESC
-            LIMIT 1
-            """,
-            (chat_id, SAVED),
-        ) as cur:
-            batch = await cur.fetchone()
-        if not batch:
-            await conn.rollback()
-            return False, "Bekor qilish uchun oxirgi saqlangan amal topilmadi.", None
-
-        batch_id = int(batch["id"])
-        deleted_at = iso_now()
-        await conn.execute(
-            "UPDATE transactions SET is_deleted = 1, deleted_at = ? WHERE batch_id = ? AND is_deleted = 0",
-            (deleted_at, batch_id),
-        )
-        await conn.execute(
-            "UPDATE batches SET status = ?, undone_at = ? WHERE id = ?",
-            (UNDONE, deleted_at, batch_id),
-        )
-        await conn.commit()
-        return True, "Oxirgi amal bekor qilindi.", batch_id
-    except Exception as exc:  # noqa: BLE001
-        await conn.rollback()
-        return False, f"Bekor qilishda xato: {exc}", None
-    finally:
-        await conn.close()
+            inserted += cursor.rowcount
+        await db.commit()
+    return inserted
 
 
 async def fetch_rows(
@@ -771,332 +629,306 @@ async def fetch_rows(
     start: Optional[datetime],
     end: Optional[datetime],
     limit: Optional[int] = None,
-) -> list[aiosqlite.Row]:
-    conn = await db_connect()
-    try:
-        sql = "SELECT * FROM transactions WHERE chat_id = ? AND is_deleted = 0"
-        params: list[Any] = [chat_id]
-        if start is not None:
-            sql += " AND tx_at >= ?"
-            params.append(start.isoformat())
-        if end is not None:
-            sql += " AND tx_at < ?"
-            params.append(end.isoformat())
-        sql += " ORDER BY tx_at DESC, id DESC"
-        if limit:
-            sql += f" LIMIT {int(limit)}"
-        async with conn.execute(sql, params) as cur:
-            return await cur.fetchall()
-    finally:
-        await conn.close()
+) -> list[dict[str, Any]]:
+    clauses = ["chat_id = ?"]
+    params: list[Any] = [chat_id]
+
+    if start is not None and end is not None:
+        clauses.append("note_date >= ?")
+        clauses.append("note_date < ?")
+        params.extend([to_iso(start), to_iso(end)])
+
+    sql = (
+        "SELECT id, note_date, author, clean_note, original_text, direction, category, counterparty, "
+        "currency, amount_original, amount_uzs, usd_rate, parser "
+        "FROM transactions WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY note_date DESC, id DESC"
+    )
+    if limit:
+        sql += " LIMIT ?"
+        params.append(limit)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
 
 
 async def delete_row(chat_id: int, row_id: int) -> bool:
-    conn = await db_connect()
-    try:
-        cur = await conn.execute(
-            """
-            UPDATE transactions
-            SET is_deleted = 1, deleted_at = ?
-            WHERE chat_id = ? AND id = ? AND is_deleted = 0
-            """,
-            (iso_now(), chat_id, row_id),
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM transactions WHERE chat_id = ? AND id = ?",
+            (chat_id, row_id),
         )
-        await conn.commit()
-        return bool(cur.rowcount)
-    finally:
-        await conn.close()
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 # =========================================================
-# REPORTING
+# REPORTS
 # =========================================================
-def split_totals(rows: list[aiosqlite.Row | dict[str, Any]]) -> tuple[int, int, int]:
-    income = 0
-    expense = 0
+def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = {
+        INCOME: {"UZS": 0.0, "USD": 0.0, "UZS_EQ": 0},
+        EXPENSE: {"UZS": 0.0, "USD": 0.0, "UZS_EQ": 0},
+        "count": len(rows),
+    }
+
     for row in rows:
         direction = row["direction"]
-        amount = int(row["amount_uzs"])
-        if direction == INCOME:
-            income += amount
-        else:
-            expense += amount
-    return income, expense, income - expense
+        currency = row["currency"]
+        summary[direction][currency] += float(row["amount_original"])
+        summary[direction]["UZS_EQ"] += int(row["amount_uzs"])
+
+    income_eq = summary[INCOME]["UZS_EQ"]
+    expense_eq = summary[EXPENSE]["UZS_EQ"]
+    summary["balance_uzs_eq"] = income_eq - expense_eq
+    return summary
 
 
-def period_title(label: str) -> str:
-    mapping = {
-        "today": "Bugungi hisobot",
-        "week": "Haftalik hisobot",
-        "month": "Oylik hisobot",
-        "all": "Umumiy hisobot",
-    }
-    return mapping.get(label, f"Hisobot: {label}")
+def build_dashboard_text(label: str, rows: list[dict[str, Any]], usd_rate: float) -> str:
+    summary = summarize_rows(rows)
+    income = summary[INCOME]
+    expense = summary[EXPENSE]
+    balance = summary["balance_uzs_eq"]
 
-
-def build_dashboard_text(label: str, rows: list[aiosqlite.Row], usd_rate: float) -> str:
-    income, expense, balance = split_totals(rows)
     lines = [
-        f"{period_title(label)}",
-        f"\nKurs: 1 USD = {money_fmt_uzs(usd_rate)}",
-        f"Kirim: {money_fmt_uzs(income)}",
-        f"Chiqim: {money_fmt_uzs(expense)}",
-        f"Balans: {money_fmt_uzs(balance)}",
-        f"Operatsiyalar: {len(rows)} ta",
+        f"📌 {label} bo‘yicha holat",
+        f"Yozuvlar soni: {summary['count']}",
+        "",
+        "📥 Kirim:",
+        f"• UZS: {money_fmt_uzs(income['UZS'])}",
+        f"• USD: {money_fmt_usd(income['USD'])}",
+        f"• UZS ekv.: {money_fmt_uzs(income['UZS_EQ'])}",
+        "",
+        "📤 Chiqim:",
+        f"• UZS: {money_fmt_uzs(expense['UZS'])}",
+        f"• USD: {money_fmt_usd(expense['USD'])}",
+        f"• UZS ekv.: {money_fmt_uzs(expense['UZS_EQ'])}",
+        "",
+        f"{balance_emoji(balance)} Sof balans: {money_fmt_uzs(balance)}",
+        f"💱 USD kursi: {money_fmt_uzs(usd_rate)}",
     ]
-    if rows:
-        lines.append("\nSo‘nggi yozuvlar:")
-        for row in rows[:5]:
-            dt = dt_fmt(parse_iso(row["tx_at"]))
-            sign = "+" if row["direction"] == INCOME else "-"
-            lines.append(
-                f"{sign} #{row['id']} | {dt} | {money_fmt_uzs(row['amount_uzs'])} | {row['note'] or row['category'] or 'Izohsiz'}"
-            )
     return "\n".join(lines)
 
 
-def build_records_text(rows: list[aiosqlite.Row]) -> str:
+def build_records_text(rows: list[dict[str, Any]]) -> str:
     if not rows:
-        return "Yozuv topilmadi."
-    lines = ["So‘nggi yozuvlar:"]
+        return "Hozircha yozuv yo‘q."
+
+    lines = ["🧾 Oxirgi yozuvlar:"]
     for row in rows:
-        dt = dt_fmt(parse_iso(row["tx_at"]))
-        if row["currency"] == "USD":
-            original = f"{money_fmt_usd(float(row['amount_original']))} → {money_fmt_uzs(row['amount_uzs'])}"
-        else:
-            original = money_fmt_uzs(row["amount_uzs"])
+        dt = from_iso(row["note_date"]).strftime("%d.%m.%Y %H:%M")
         sign = "+" if row["direction"] == INCOME else "-"
-        extra = f" | {row['counterparty']}" if row["counterparty"] else ""
-        lines.append(
-            f"{sign} #{row['id']} | {dt} | {original} | {row['note'] or 'Izohsiz'}{extra}"
+        amount = (
+            money_fmt_usd(float(row["amount_original"]))
+            if row["currency"] == "USD"
+            else money_fmt_uzs(float(row["amount_original"]))
         )
+        tail = []
+        if row["category"]:
+            tail.append(row["category"])
+        if row["counterparty"]:
+            tail.append(row["counterparty"])
+        extra = f" [{', '.join(tail)}]" if tail else ""
+        lines.append(f"#{row['id']} | {dt} | {sign}{amount} | {row['clean_note']}{extra}")
     return "\n".join(lines)
 
 
-def build_category_text(rows: list[aiosqlite.Row]) -> str:
+def build_category_text(rows: list[dict[str, Any]]) -> str:
     if not rows:
-        return "Kategoriya bo‘yicha yozuv topilmadi."
-    summary: dict[str, dict[str, int]] = {}
+        return "Bu davrda kategoriya bo‘yicha yozuv yo‘q."
+
+    stats: dict[str, dict[str, float]] = {}
     for row in rows:
-        cat = row["category"] or "Boshqa"
-        bucket = summary.setdefault(cat, {"income": 0, "expense": 0})
-        bucket[row["direction"]] += int(row["amount_uzs"])
-    lines = ["Kategoriya kesimi:"]
-    for cat, stats in sorted(summary.items(), key=lambda x: x[1]["income"] + x[1]["expense"], reverse=True):
+        category = row["category"] or "Boshqa"
+        bucket = stats.setdefault(category, {"income": 0.0, "expense": 0.0})
+        bucket[row["direction"]] += float(row["amount_uzs"])
+
+    sorted_items = sorted(
+        stats.items(), key=lambda item: (item[1]["income"] - item[1]["expense"]), reverse=True
+    )
+    lines = ["📚 Kategoriya kesimi (UZS ekvivalent):"]
+    for name, values in sorted_items:
+        balance = int(values["income"] - values["expense"])
         lines.append(
-            f"• {cat}: kirim {money_fmt_uzs(stats['income'])}, chiqim {money_fmt_uzs(stats['expense'])}, balans {money_fmt_uzs(stats['income'] - stats['expense'])}"
+            f"• {name}: +{money_fmt_uzs(values['income'])} / -{money_fmt_uzs(values['expense'])} / {money_fmt_uzs(balance)}"
         )
     return "\n".join(lines)
 
 
-def build_preview_text(transactions: list[ParsedTransaction], usd_rate: float) -> str:
-    income, expense, balance = split_totals([asdict(item) for item in transactions])
-    lines = [
-        "Tekshiruv preview:",
-        f"\nKurs: 1 USD = {money_fmt_uzs(usd_rate)}",
-        f"Kirim: {money_fmt_uzs(income)}",
-        f"Chiqim: {money_fmt_uzs(expense)}",
-        f"Balans: {money_fmt_uzs(balance)}",
-        f"Yozuvlar: {len(transactions)} ta",
-        "\nQuyidagilar saqlanadi:",
-    ]
-    for idx, tx in enumerate(transactions[:20], start=1):
-        dt = dt_fmt(parse_iso(tx.tx_at))
-        sign = "+" if tx.direction == INCOME else "-"
-        if tx.currency == "USD":
-            amount = f"{money_fmt_usd(tx.amount_original)} → {money_fmt_uzs(tx.amount_uzs)}"
-        else:
-            amount = money_fmt_uzs(tx.amount_uzs)
-        tail = f" | {tx.note}" if tx.note else ""
-        cat = f" | {tx.category}" if tx.category else ""
-        lines.append(f"{idx}) {sign} {dt} | {amount}{cat}{tail}")
-    if len(transactions) > 20:
-        lines.append(f"… yana {len(transactions) - 20} ta yozuv bor")
-    lines.append("\nSaqlansinmi?")
-    return "\n".join(lines)
-
-
-def pending_keyboard(batch_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Saqlash", callback_data=f"batch:save:{batch_id}"),
-                InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"batch:cancel:{batch_id}"),
-            ]
-        ]
-    )
-
-
-def undo_keyboard(batch_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="↩️ Oxirgi amalni bekor qilish", callback_data=f"batch:undo:{batch_id}")]
-        ]
-    )
-
-
-def autosize_sheet(ws) -> None:  # noqa: ANN001
-    for column_cells in ws.columns:
-        length = 0
-        col_letter = get_column_letter(column_cells[0].column)
+def autosize_sheet(ws) -> None:
+    for col_idx, column_cells in enumerate(ws.columns, start=1):
+        max_length = 0
         for cell in column_cells:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-            length = max(length, len(str(cell.value or "")))
-        ws.column_dimensions[col_letter].width = min(max(length + 2, 12), 40)
+            value = "" if cell.value is None else str(cell.value)
+            max_length = max(max_length, len(value))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_length + 2, 38)
 
 
-def write_table_sheet(ws, title: str, rows: list[aiosqlite.Row]) -> None:  # noqa: ANN001
+def add_table_sheet(wb: Workbook, title: str, rows: list[dict[str, Any]], direction: Optional[str]) -> None:
+    ws = wb.create_sheet(title)
     headers = [
         "ID",
         "Sana",
-        "Yil",
-        "Oy",
-        "Kun",
-        "Soat",
+        "Muallif",
         "Yo‘nalish",
-        "Valyuta",
-        "Asl summa",
-        "USD kurs",
-        "UZS summa",
         "Kategoriya",
         "Kontragent",
+        "Valyuta",
+        "Original summa",
+        "UZS ekv.",
         "Izoh",
-        "Muallif",
-        "Batch ID",
-        "Xom satr",
+        "Asl matn",
     ]
-    ws.title = title
     ws.append(headers)
+
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
     thin = Side(style="thin", color="D9D9D9")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
     for cell in ws[1]:
         cell.fill = header_fill
         cell.font = header_font
-        cell.border = border
         cell.alignment = Alignment(horizontal="center", vertical="center")
-    for row in rows:
-        dt = parse_iso(row["tx_at"])
-        original = money_fmt_usd(float(row["amount_original"])) if row["currency"] == "USD" else money_fmt_uzs(row["amount_original"])
+        cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    filtered = rows if direction is None else [row for row in rows if row["direction"] == direction]
+    for row in filtered:
+        dt = from_iso(row["note_date"]).strftime("%d.%m.%Y %H:%M")
+        original_amount = (
+            money_fmt_usd(float(row["amount_original"]))
+            if row["currency"] == "USD"
+            else money_fmt_uzs(float(row["amount_original"]))
+        )
         ws.append(
             [
                 row["id"],
-                dt_fmt(dt),
-                dt.year,
-                dt.month,
-                dt.day,
-                dt.strftime("%H:%M"),
+                dt,
+                row["author"],
                 "Kirim" if row["direction"] == INCOME else "Chiqim",
-                row["currency"],
-                original,
-                row["usd_rate"],
-                row["amount_uzs"],
                 row["category"],
                 row["counterparty"],
-                row["note"],
-                row["author_name"],
-                row["batch_id"],
-                row["raw_line"],
+                row["currency"],
+                original_amount,
+                int(row["amount_uzs"]),
+                row["clean_note"],
+                row["original_text"],
             ]
         )
+
     ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
     autosize_sheet(ws)
 
 
-def build_excel(rows: list[aiosqlite.Row], label: str, usd_rate: float) -> str:
+def build_excel(rows: list[dict[str, Any]], period_label: str, usd_rate: float) -> str:
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Dashboard"
-    income, expense, balance = split_totals(rows)
-    dashboard_rows = [
-        ["Hisobot", period_title(label)],
-        ["Kurs", f"1 USD = {money_fmt_uzs(usd_rate)}"],
-        ["Kirim", income],
-        ["Chiqim", expense],
-        ["Balans", balance],
-        ["Operatsiyalar soni", len(rows)],
-        ["Yaratilgan vaqt", dt_fmt(now_local())],
+    dashboard = wb.active
+    dashboard.title = "Dashboard"
+
+    title_fill = PatternFill("solid", fgColor="0F766E")
+    section_fill = PatternFill("solid", fgColor="E2F0D9")
+    white_font = Font(color="FFFFFF", bold=True, size=12)
+    bold_font = Font(bold=True)
+
+    dashboard.merge_cells("A1:D1")
+    dashboard["A1"] = f"Finance Dashboard — {period_label}"
+    dashboard["A1"].fill = title_fill
+    dashboard["A1"].font = white_font
+    dashboard["A1"].alignment = Alignment(horizontal="center")
+
+    summary = summarize_rows(rows)
+    dashboard["A3"] = "Ko‘rsatkich"
+    dashboard["B3"] = "Qiymat"
+    dashboard["A3"].fill = section_fill
+    dashboard["B3"].fill = section_fill
+    dashboard["A3"].font = bold_font
+    dashboard["B3"].font = bold_font
+
+    metrics = [
+        ("Yozuvlar soni", summary["count"]),
+        ("Kirim UZS", money_fmt_uzs(summary[INCOME]["UZS"])),
+        ("Kirim USD", money_fmt_usd(summary[INCOME]["USD"])),
+        ("Kirim UZS ekv.", money_fmt_uzs(summary[INCOME]["UZS_EQ"])),
+        ("Chiqim UZS", money_fmt_uzs(summary[EXPENSE]["UZS"])),
+        ("Chiqim USD", money_fmt_usd(summary[EXPENSE]["USD"])),
+        ("Chiqim UZS ekv.", money_fmt_uzs(summary[EXPENSE]["UZS_EQ"])),
+        ("Sof balans", money_fmt_uzs(summary["balance_uzs_eq"])),
+        ("USD kursi", money_fmt_uzs(usd_rate)),
     ]
-    for row in dashboard_rows:
-        ws.append(row)
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-    autosize_sheet(ws)
+    for idx, pair in enumerate(metrics, start=4):
+        dashboard[f"A{idx}"] = pair[0]
+        dashboard[f"B{idx}"] = pair[1]
 
-    all_rows = rows
-    income_rows = [row for row in rows if row["direction"] == INCOME]
-    expense_rows = [row for row in rows if row["direction"] == EXPENSE]
+    autosize_sheet(dashboard)
+    add_table_sheet(wb, "Barcha", rows, None)
+    add_table_sheet(wb, "Kirim", rows, INCOME)
+    add_table_sheet(wb, "Chiqim", rows, EXPENSE)
 
-    write_table_sheet(wb.create_sheet(), "Barcha", all_rows)
-    write_table_sheet(wb.create_sheet(), "Kirim", income_rows)
-    write_table_sheet(wb.create_sheet(), "Chiqim", expense_rows)
-
-    fd, path = tempfile.mkstemp(prefix=f"finance_{label}_", suffix=".xlsx")
+    fd, path = tempfile.mkstemp(prefix="finance_report_", suffix=".xlsx")
     os.close(fd)
     wb.save(path)
     return path
 
 
 # =========================================================
-# ACCESS / COMMON ACTIONS
+# BOT COMMANDS
 # =========================================================
-async def guard_message(message: Message) -> bool:
-    if not ADMIN_IDS:
-        return True
-    user_id = message.from_user.id if message.from_user else None
-    if user_id in ADMIN_IDS:
-        return True
-    await message.answer("Siz bu botdan foydalanish uchun ruxsatli emassiz.")
-    return False
+async def set_bot_commands(bot: Bot) -> None:
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Menyu"),
+            BotCommand(command="help", description="Yordam"),
+            BotCommand(command="stats", description="Statistika"),
+            BotCommand(command="balance", description="Balans"),
+            BotCommand(command="records", description="Oxirgi yozuvlar"),
+            BotCommand(command="export", description="Excel eksport"),
+            BotCommand(command="rate", description="USD kursi"),
+            BotCommand(command="delete", description="Yozuvni o‘chirish"),
+            BotCommand(command="categories", description="Kategoriya kesimi"),
+        ]
+    )
 
 
-async def guard_callback(callback: CallbackQuery) -> bool:
-    if not ADMIN_IDS:
-        return True
-    if callback.from_user.id in ADMIN_IDS:
-        return True
-    await callback.answer("Ruxsat yo‘q", show_alert=True)
-    return False
-
-
-async def send_dashboard(message: Message, period: str) -> None:
+async def send_dashboard(message: Message, period: str = "month") -> None:
+    usd_rate = await get_usd_rate()
     start, end, label = parse_period(period)
     rows = await fetch_rows(message.chat.id, start, end)
-    usd_rate = await get_usd_rate()
-    await message.answer(build_dashboard_text(label, rows, usd_rate), reply_markup=MAIN_KB)
+    await message.answer(build_dashboard_text(label, rows, usd_rate), reply_markup=MAIN_KEYBOARD)
 
 
-async def send_records(message: Message, limit: int = 10) -> None:
-    rows = await fetch_rows(message.chat.id, None, None, limit=limit)
-    await message.answer(build_records_text(rows), reply_markup=MAIN_KB)
-
-
-# =========================================================
-# COMMANDS
-# =========================================================
 @router.message(CommandStart())
 async def start_handler(message: Message) -> None:
-    if not await guard_message(message):
+    if not await guard(message):
         return
     await message.answer(
-        "Assalomu alaykum. Matn yuboring, men avval preview ko‘rsataman, keyin tasdiqlasangiz bazaga yozaman.",
-        reply_markup=MAIN_KB,
+        "Assalomu alaykum. Matn yuboring — bot summalarni ajratadi, bazaga yozadi va hisobot tayyorlaydi.",
+        reply_markup=MAIN_KEYBOARD,
     )
     await send_dashboard(message, "month")
 
 
 @router.message(Command("help"))
 async def help_handler(message: Message) -> None:
-    if not await guard_message(message):
+    if not await guard(message):
         return
-    await message.answer(HELP_TEXT, reply_markup=MAIN_KB)
+    await message.answer(HELP_TEXT, reply_markup=MAIN_KEYBOARD)
 
 
 @router.message(Command("stats"))
-@router.message(Command("balance"))
 async def stats_handler(message: Message) -> None:
-    if not await guard_message(message):
+    if not await guard(message):
+        return
+    arg = message.text.split(maxsplit=1)[1] if message.text and " " in message.text else "month"
+    await send_dashboard(message, arg)
+
+
+@router.message(Command("balance"))
+async def balance_handler(message: Message) -> None:
+    if not await guard(message):
         return
     arg = message.text.split(maxsplit=1)[1] if message.text and " " in message.text else "month"
     await send_dashboard(message, arg)
@@ -1104,307 +936,236 @@ async def stats_handler(message: Message) -> None:
 
 @router.message(Command("records"))
 async def records_handler(message: Message) -> None:
-    if not await guard_message(message):
+    if not await guard(message):
         return
     limit = 10
     if message.text and " " in message.text:
         raw = message.text.split(maxsplit=1)[1].strip()
         if raw.isdigit():
-            limit = min(max(int(raw), 1), 100)
-    await send_records(message, limit)
+            limit = min(max(int(raw), 1), 50)
+    rows = await fetch_rows(message.chat.id, None, None, limit=limit)
+    await message.answer(build_records_text(rows), reply_markup=MAIN_KEYBOARD)
 
 
 @router.message(Command("categories"))
 async def categories_handler(message: Message) -> None:
-    if not await guard_message(message):
+    if not await guard(message):
         return
     arg = message.text.split(maxsplit=1)[1] if message.text and " " in message.text else "month"
-    start, end, _ = parse_period(arg)
+    start, end, _label = parse_period(arg)
     rows = await fetch_rows(message.chat.id, start, end)
-    await message.answer(build_category_text(rows), reply_markup=MAIN_KB)
+    await message.answer(build_category_text(rows), reply_markup=MAIN_KEYBOARD)
 
 
 @router.message(Command("rate"))
 async def rate_handler(message: Message) -> None:
-    if not await guard_message(message):
+    if not await guard(message):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) == 1:
         rate = await get_usd_rate()
         await message.answer(
-            f"Joriy USD kursi: {money_fmt_uzs(rate)}\nYangilash uchun: /rate 12800",
-            reply_markup=MAIN_KB,
+            f"Joriy USD kursi: {money_fmt_uzs(rate)}\nYangi kurs: /rate 12800",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
+
     raw_value = parts[1].replace(" ", "").replace(",", ".")
     try:
         value = float(raw_value)
         if value <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("Kurs noto‘g‘ri. Misol: /rate 12750", reply_markup=MAIN_KB)
+        await message.answer("Kurs noto‘g‘ri. Misol: /rate 12750", reply_markup=MAIN_KEYBOARD)
         return
+
     await set_setting("usd_rate", str(value))
-    await message.answer(f"✅ USD kursi saqlandi: {money_fmt_uzs(value)}", reply_markup=MAIN_KB)
+    await message.answer(f"✅ USD kursi saqlandi: {money_fmt_uzs(value)}", reply_markup=MAIN_KEYBOARD)
+
+
+@router.message(Command("delete"))
+async def delete_handler(message: Message) -> None:
+    if not await guard(message):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 1 or not parts[1].strip().isdigit():
+        await message.answer("Misol: /delete 15", reply_markup=MAIN_KEYBOARD)
+        return
+    row_id = int(parts[1].strip())
+    deleted = await delete_row(message.chat.id, row_id)
+    if deleted:
+        await message.answer(f"🗑 #{row_id} o‘chirildi.", reply_markup=MAIN_KEYBOARD)
+    else:
+        await message.answer(f"#{row_id} topilmadi.", reply_markup=MAIN_KEYBOARD)
 
 
 @router.message(Command("export"))
 async def export_handler(message: Message) -> None:
-    if not await guard_message(message):
+    if not await guard(message):
         return
     arg = message.text.split(maxsplit=1)[1] if message.text and " " in message.text else "month"
     start, end, label = parse_period(arg)
+    usd_rate = await get_usd_rate()
     rows = await fetch_rows(message.chat.id, start, end)
     if not rows:
-        await message.answer("Eksport uchun yozuv topilmadi.", reply_markup=MAIN_KB)
+        await message.answer("Eksport uchun yozuv topilmadi.", reply_markup=MAIN_KEYBOARD)
         return
-    usd_rate = await get_usd_rate()
+
     path = build_excel(rows, label, usd_rate)
     try:
         await message.answer_document(
             FSInputFile(path, filename=f"finance_{label}.xlsx"),
             caption=build_dashboard_text(label, rows, usd_rate),
-            reply_markup=MAIN_KB,
+            reply_markup=MAIN_KEYBOARD,
         )
     finally:
         Path(path).unlink(missing_ok=True)
-
-
-@router.message(Command("undo"))
-async def undo_handler(message: Message) -> None:
-    if not await guard_message(message):
-        return
-    ok, text, _batch_id = await undo_last_batch(message.chat.id)
-    await message.answer(("✅ " if ok else "⚠️ ") + text, reply_markup=MAIN_KB)
-    if ok:
-        await send_dashboard(message, "month")
-
-
-@router.message(Command("delete"))
-async def delete_handler(message: Message) -> None:
-    if not await guard_message(message):
-        return
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip().isdigit():
-        await message.answer("Misol: /delete 15", reply_markup=MAIN_KB)
-        return
-    row_id = int(parts[1].strip())
-    deleted = await delete_row(message.chat.id, row_id)
-    if deleted:
-        await message.answer(f"🗑 #{row_id} o‘chirildi.", reply_markup=MAIN_KB)
-    else:
-        await message.answer(f"#{row_id} topilmadi.", reply_markup=MAIN_KB)
 
 
 # =========================================================
 # BUTTONS
 # =========================================================
-@router.message(F.text == BTN_TODAY)
-async def btn_today(message: Message) -> None:
-    if not await guard_message(message):
+@router.message(F.text == BUTTON_TODAY)
+async def button_today(message: Message) -> None:
+    if not await guard(message):
         return
     await send_dashboard(message, "today")
 
 
-@router.message(F.text == BTN_MONTH)
-async def btn_month(message: Message) -> None:
-    if not await guard_message(message):
+@router.message(F.text == BUTTON_MONTH)
+async def button_month(message: Message) -> None:
+    if not await guard(message):
         return
     await send_dashboard(message, "month")
 
 
-@router.message(F.text == BTN_BALANCE)
-async def btn_balance(message: Message) -> None:
-    if not await guard_message(message):
+@router.message(F.text == BUTTON_BALANCE)
+async def button_balance(message: Message) -> None:
+    if not await guard(message):
         return
-    await send_dashboard(message, "all")
+    await send_dashboard(message, "month")
 
 
-@router.message(F.text == BTN_RECORDS)
-async def btn_records(message: Message) -> None:
-    if not await guard_message(message):
+@router.message(F.text == BUTTON_EXPORT)
+async def button_export(message: Message) -> None:
+    if not await guard(message):
         return
-    await send_records(message, 10)
+    message.text = "/export month"
+    await export_handler(message)
 
 
-@router.message(F.text == BTN_EXPORT)
-async def btn_export(message: Message) -> None:
-    if not await guard_message(message):
+@router.message(F.text == BUTTON_RECORDS)
+async def button_records(message: Message) -> None:
+    if not await guard(message):
         return
-    rows = await fetch_rows(message.chat.id, *parse_period("month")[:2])
-    if not rows:
-        await message.answer("Eksport uchun yozuv topilmadi.", reply_markup=MAIN_KB)
-        return
-    usd_rate = await get_usd_rate()
-    path = build_excel(rows, "month", usd_rate)
-    try:
-        await message.answer_document(
-            FSInputFile(path, filename="finance_month.xlsx"),
-            caption=build_dashboard_text("month", rows, usd_rate),
-            reply_markup=MAIN_KB,
-        )
-    finally:
-        Path(path).unlink(missing_ok=True)
+    message.text = "/records 10"
+    await records_handler(message)
 
 
-@router.message(F.text == BTN_UNDO)
-async def btn_undo(message: Message) -> None:
-    if not await guard_message(message):
+@router.message(F.text == BUTTON_RATE)
+async def button_rate(message: Message) -> None:
+    if not await guard(message):
         return
-    ok, text, _ = await undo_last_batch(message.chat.id)
-    await message.answer(("✅ " if ok else "⚠️ ") + text, reply_markup=MAIN_KB)
-    if ok:
-        await send_dashboard(message, "month")
+    rate = await get_usd_rate()
+    await message.answer(
+        f"Joriy USD kursi: {money_fmt_uzs(rate)}\nYangi kurs berish uchun: /rate 12800",
+        reply_markup=MAIN_KEYBOARD,
+    )
 
 
-@router.message(F.text == BTN_HELP)
-async def btn_help(message: Message) -> None:
-    if not await guard_message(message):
+@router.message(F.text == BUTTON_HELP)
+async def button_help(message: Message) -> None:
+    if not await guard(message):
         return
-    await message.answer(HELP_TEXT, reply_markup=MAIN_KB)
-
-
-# =========================================================
-# CALLBACKS
-# =========================================================
-@router.callback_query(F.data.startswith("batch:save:"))
-async def callback_save_batch(callback: CallbackQuery) -> None:
-    if not await guard_callback(callback):
-        return
-    batch_id = int(callback.data.split(":")[-1])
-    if not callback.message:
-        await callback.answer("Xabar topilmadi", show_alert=True)
-        return
-    batch = await get_batch(batch_id)
-    if not batch or batch["chat_id"] != callback.message.chat.id:
-        await callback.answer("Batch topilmadi", show_alert=True)
-        return
-    ok, text = await save_batch(batch_id)
-    await callback.answer("Saqlandi" if ok else "Xato", show_alert=not ok)
-    if callback.message:
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except TelegramBadRequest:
-            pass
-        await callback.message.answer(
-            ("✅ " if ok else "⚠️ ") + text,
-            reply_markup=undo_keyboard(batch_id) if ok else MAIN_KB,
-        )
-        if ok:
-            await send_dashboard(callback.message, "month")
-
-
-@router.callback_query(F.data.startswith("batch:cancel:"))
-async def callback_cancel_batch(callback: CallbackQuery) -> None:
-    if not await guard_callback(callback):
-        return
-    batch_id = int(callback.data.split(":")[-1])
-    ok, text = await cancel_batch(batch_id)
-    await callback.answer("Bekor qilindi" if ok else "Xato", show_alert=not ok)
-    if callback.message:
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except TelegramBadRequest:
-            pass
-        await callback.message.answer(("❌ " if ok else "⚠️ ") + text, reply_markup=MAIN_KB)
-
-
-@router.callback_query(F.data.startswith("batch:undo:"))
-async def callback_undo_batch(callback: CallbackQuery) -> None:
-    if not await guard_callback(callback):
-        return
-    batch_id = int(callback.data.split(":")[-1])
-    if not callback.message:
-        await callback.answer("Xabar topilmadi", show_alert=True)
-        return
-    batch = await get_batch(batch_id)
-    if not batch or batch["chat_id"] != callback.message.chat.id:
-        await callback.answer("Batch topilmadi", show_alert=True)
-        return
-    ok, text, undone_id = await undo_last_batch(callback.message.chat.id)
-    if ok and undone_id != batch_id:
-        text = f"Oxirgi saqlangan batch #{undone_id} bekor qilindi. So‘ralgan batch esa eng oxirgisi emas edi."
-    await callback.answer("Bekor qilindi" if ok else "Xato", show_alert=not ok)
-    if callback.message:
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except TelegramBadRequest:
-            pass
-        await callback.message.answer(("↩️ " if ok else "⚠️ ") + text, reply_markup=MAIN_KB)
-        if ok:
-            await send_dashboard(callback.message, "month")
+    await message.answer(HELP_TEXT, reply_markup=MAIN_KEYBOARD)
 
 
 # =========================================================
 # TEXT INGESTION
 # =========================================================
 @router.message(F.text)
-async def ingest_text(message: Message) -> None:
-    if not await guard_message(message):
+async def ingest_text_handler(message: Message) -> None:
+    if not await guard(message):
         return
     text = (message.text or "").strip()
     if not text or text.startswith("/"):
         return
 
     usd_rate = await get_usd_rate()
-    transactions = await build_transactions_from_text(
-        text=text,
-        author=safe_author(message),
-        base_dt=message.date.astimezone(TZ),
-        usd_rate=usd_rate,
-    )
-    if not transactions:
-        await message.answer(
-            "Summalar topilmadi. Misol yuboring: +250$ klient yoki 100 ming dostavka",
-            reply_markup=MAIN_KB,
+    lines = extract_lines(text, safe_author(message))
+
+    inserted_total = 0
+    parsed_count = 0
+    skipped_lines: list[str] = []
+    income_hits = 0
+    expense_hits = 0
+    income_uzs = 0
+    expense_uzs = 0
+
+    for parsed_line in lines:
+        hits = parse_money_hits(parsed_line.body, usd_rate)
+        if not hits:
+            skipped_lines.append(parsed_line.raw_line)
+            continue
+
+        meta = await enrich_metadata(parsed_line.body, hits)
+        inserted = await save_transactions(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            user_id=message.from_user.id if message.from_user else None,
+            parsed_line=parsed_line,
+            hits=hits,
+            meta=meta,
+            usd_rate=usd_rate,
         )
-        return
+        inserted_total += inserted
+        parsed_count += 1
+        for hit in hits:
+            if hit.direction == INCOME:
+                income_hits += 1
+                income_uzs += hit.amount_uzs
+            else:
+                expense_hits += 1
+                expense_uzs += hit.amount_uzs
 
-    preview = build_preview_text(transactions, usd_rate)
-    batch_id = await create_pending_batch(
-        chat_id=message.chat.id,
-        source_message_id=message.message_id,
-        user_id=message.from_user.id if message.from_user else None,
-        author_name=safe_author(message),
-        raw_text=text,
-        transactions=transactions,
-        preview_text=preview,
-    )
-    await message.answer(preview, reply_markup=pending_keyboard(batch_id))
+    month_start, month_end, label = parse_period("month")
+    month_rows = await fetch_rows(message.chat.id, month_start, month_end)
+    month_text = build_dashboard_text(label, month_rows, usd_rate)
+
+    reply_lines = [
+        "✅ Matn qayta ishlindi.",
+        f"Qatorlar: {len(lines)} | Summali qatorlar: {parsed_count}",
+        f"Yangi yozuvlar: {inserted_total}",
+        f"Kirim soni: {income_hits} | UZS ekv.: {money_fmt_uzs(income_uzs)}",
+        f"Chiqim soni: {expense_hits} | UZS ekv.: {money_fmt_uzs(expense_uzs)}",
+    ]
+    if skipped_lines:
+        reply_lines.append(f"Summa topilmagan qatorlar: {len(skipped_lines)}")
+    reply_lines.extend(["", month_text])
+    await message.answer("\n".join(reply_lines), reply_markup=MAIN_KEYBOARD)
 
 
 # =========================================================
-# BOOTSTRAP
+# MAIN
 # =========================================================
-async def set_commands(bot: Bot) -> None:
-    await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Botni ishga tushirish"),
-            BotCommand(command="help", description="Yordam"),
-            BotCommand(command="stats", description="Statistika"),
-            BotCommand(command="records", description="So‘nggi yozuvlar"),
-            BotCommand(command="export", description="Excel hisobot"),
-            BotCommand(command="rate", description="USD kursi"),
-            BotCommand(command="undo", description="Oxirgi amalni bekor qilish"),
-        ]
-    )
-
-
 async def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN topilmadi")
 
     await init_db()
     bot = Bot(BOT_TOKEN)
+    await set_bot_commands(bot)
+
     dp = Dispatcher()
     dp.include_router(router)
-    await set_commands(bot)
-    logger.info("Bot ishga tushdi")
+
+    logger.info("Bot ishga tushmoqda…")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+    except KeyboardInterrupt:
         logger.info("Bot to‘xtatildi")
