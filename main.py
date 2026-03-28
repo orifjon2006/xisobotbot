@@ -497,6 +497,150 @@ async def parse_text_to_records(raw_text: str, default_author: str) -> List[Pars
     return records
 
 
+
+def parse_webapp_datetime(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return now_iso()
+    for candidate in (
+        raw,
+        raw.replace("Z", "+00:00"),
+    ):
+        try:
+            dt = datetime.fromisoformat(candidate)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(TZ).replace(tzinfo=None)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    return now_iso()
+
+
+async def structured_webapp_tx_to_record(
+    tx: Dict[str, Any],
+    author_name: str,
+    source_kind: str = "mini_app_structured",
+    raw_payload: Optional[Dict[str, Any]] = None,
+) -> ParsedRecord:
+    usd_rate = await get_usd_rate()
+    tx_type_raw = str(tx.get("type") or "expense").strip().lower()
+    tx_type = "income" if tx_type_raw == "income" else "expense"
+
+    currency_raw = str(tx.get("currency") or "UZS").strip().upper()
+    currency = "USD" if currency_raw == "USD" else "UZS"
+
+    amount_original_raw = tx.get("amountOriginal", tx.get("amount", tx.get("amount_original", 0)))
+    amount_uzs_raw = tx.get("amountUZS", tx.get("amount_uzs", 0))
+
+    try:
+        amount_original_dec = Decimal(str(amount_original_raw).replace(" ", ""))
+    except Exception:
+        amount_original_dec = Decimal("0")
+
+    try:
+        amount_uzs_dec = Decimal(str(amount_uzs_raw).replace(" ", ""))
+    except Exception:
+        amount_uzs_dec = Decimal("0")
+
+    if amount_original_dec <= 0 and amount_uzs_dec > 0:
+        if currency == "USD":
+            amount_original_dec = (amount_uzs_dec / usd_rate) if usd_rate > 0 else Decimal("0")
+        else:
+            amount_original_dec = amount_uzs_dec
+
+    if amount_uzs_dec <= 0 and amount_original_dec > 0:
+        if currency == "USD":
+            amount_uzs_dec = amount_original_dec * usd_rate
+        else:
+            amount_uzs_dec = amount_original_dec
+
+    if amount_uzs_dec <= 0:
+        raise ValueError("amount_uzs is zero")
+
+    description = str(tx.get("description") or tx.get("desc") or tx.get("note") or "").strip()
+    if not description:
+        description = "Web App orqali qo‘shilgan yozuv"
+
+    category = str(tx.get("category") or "").strip().lower()
+    counterparty = str(tx.get("counterparty") or "").strip()
+    if not category or category == "boshqa":
+        detected_category, detected_counterparty = detect_category_and_counterparty(description)
+        category = detected_category or "boshqa"
+        if not counterparty:
+            counterparty = detected_counterparty
+
+    meta = {
+        "source": "web_app",
+        "event": str((raw_payload or {}).get("event") or "transaction_add"),
+        "local_transaction_id": tx.get("id") or tx.get("transactionId") or tx.get("local_id"),
+        "raw_payload": raw_payload or tx,
+    }
+
+    source_text = json.dumps(raw_payload or tx, ensure_ascii=False)
+
+    return ParsedRecord(
+        tx_type=tx_type,
+        amount_uzs=int(amount_uzs_dec.quantize(Decimal("1"), rounding=ROUND_HALF_UP)),
+        currency=currency,
+        amount_original=money_fmt_decimal(amount_original_dec),
+        usd_rate_used=money_fmt_decimal(usd_rate),
+        description=description,
+        author_name=author_name,
+        tx_at=parse_webapp_datetime(tx.get("dateISO") or tx.get("tx_at") or tx.get("date")),
+        source_text=source_text,
+        source_kind=source_kind,
+        category=category or "boshqa",
+        counterparty=counterparty,
+        meta_json=json.dumps(meta, ensure_ascii=False),
+    )
+
+
+async def save_structured_webapp_items(
+    owner_id: int,
+    author_name: str,
+    payload: Dict[str, Any],
+) -> Tuple[int, List[ParsedRecord]]:
+    event = str(payload.get("event") or "transaction_add").strip().lower()
+    source_kind = str(payload.get("source") or f"mini_app_{event}").strip() or f"mini_app_{event}"
+    raw_source_text = json.dumps(payload, ensure_ascii=False)
+
+    tx_objects: List[Dict[str, Any]] = []
+    if event == "transaction_add":
+        tx = payload.get("transaction") or {}
+        if isinstance(tx, dict) and tx:
+            tx_objects = [tx]
+    elif event == "bulk_import":
+        raw_items = payload.get("items") or payload.get("transactions") or []
+        if isinstance(raw_items, list):
+            tx_objects = [x for x in raw_items if isinstance(x, dict)]
+
+    items: List[ParsedRecord] = []
+    for tx in tx_objects:
+        try:
+            items.append(await structured_webapp_tx_to_record(tx, author_name, source_kind=source_kind, raw_payload=payload))
+        except Exception as exc:
+            logger.exception("WebApp structured transaction parse error: %s", exc)
+
+    if not items:
+        raise ValueError("Structured WebApp payloadda saqlanadigan yozuv topilmadi")
+
+    pending = PendingBatch(
+        owner_id=owner_id,
+        source_text=raw_source_text,
+        created_at=now_iso(),
+        summary_text="",
+        items=items,
+    )
+    batch_id = await save_pending_batch(pending)
+    return batch_id, items
+
+
+
 def summarize_records(items: List[ParsedRecord]) -> Tuple[str, int, int, int]:
     income = sum(x.amount_uzs for x in items if x.tx_type == "income")
     expense = sum(x.amount_uzs for x in items if x.tx_type == "expense")
@@ -854,6 +998,7 @@ async def cmd_start(message: types.Message):
         return
     await message.answer(
         "Assalomu alaykum. Bot tayyor. Oddiy matn, Telegram export yoki Web App orqali yozuv yuborishingiz mumkin.\n\n"
+        "Web App ochish uchun pastdagi <b>🧾 Web App</b> tugmasini bosing.\n"
         "Misol: <code>+250$+517 ming azam aka labo berari olindi</code>",
         reply_markup=main_kb(),
     )
@@ -1109,11 +1254,61 @@ async def btn_export(message: types.Message):
 
 @dp.message_handler(content_types=types.ContentType.WEB_APP_DATA)
 async def handle_web_app_data(message: types.Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
     try:
         payload = json.loads(message.web_app_data.data)
     except Exception:
         await message.answer("Web App dan noto‘g‘ri JSON keldi.")
         return
+
+    event = str(payload.get("event") or "").strip().lower()
+
+    if event in {"transaction_add", "bulk_import", "sync_snapshot", "transaction_delete"}:
+        if event in {"transaction_add", "bulk_import"}:
+            try:
+                batch_id, items = await save_structured_webapp_items(
+                    owner_id=message.from_user.id,
+                    author_name=message.from_user.full_name,
+                    payload=payload,
+                )
+            except ValueError as exc:
+                await message.answer(f"❌ {exc}", reply_markup=main_kb())
+                return
+            summary, income, expense, net = summarize_records(items)
+            await message.answer(
+                f"✅ Web App yozuvi saqlandi. Batch #{batch_id}\n{summary}",
+                reply_markup=main_kb(),
+            )
+            return
+
+        if event == "sync_snapshot":
+            summary = payload.get("summary") or {}
+            live = await fetch_totals("live")
+            lines = [
+                "<b>Web App snapshot qabul qilindi</b>",
+                f"Web App yozuvlar soni: {summary.get('count', 0)} ta",
+                f"Web App balans: {money_fmt_uzs(summary.get('total', 0))}",
+                f"Bot live balans: {money_fmt_uzs(live['net'])}",
+            ]
+            await message.answer("\n".join(lines), reply_markup=main_kb())
+            return
+
+        if event == "transaction_delete":
+            db_record_id = payload.get("db_record_id") or payload.get("record_id")
+            if str(db_record_id).isdigit():
+                ok = await delete_record(int(db_record_id))
+                await message.answer(
+                    "🗑 Serverdagi yozuv o‘chirildi" if ok else "Serverdagi yozuv topilmadi",
+                    reply_markup=main_kb(),
+                )
+            else:
+                await message.answer(
+                    "ℹ️ Web App local o‘chirish qayd etildi. Serverdagi yozuvni o‘chirish uchun db_record_id yuborilishi kerak.",
+                    reply_markup=main_kb(),
+                )
+            return
+
     raw_text = (payload.get("text") or "").strip()
     note = (payload.get("note") or "").strip()
     source = (payload.get("source") or "mini_app").strip()
