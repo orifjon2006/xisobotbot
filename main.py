@@ -5,19 +5,20 @@ import json
 import logging
 import os
 import re
-import secrets
-from collections import defaultdict
-from contextlib import suppress
-from dataclasses import dataclass, asdict
+import tempfile
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from urllib.parse import parse_qsl
+import hashlib
+import hmac
 
 import aiohttp
 import aiosqlite
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, executor, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
@@ -25,484 +26,319 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputFile,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    WebAppInfo,
 )
 from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except Exception:
+    ZoneInfo = None
+    ZoneInfoNotFoundError = Exception
+
 load_dotenv()
 
-# ---------------------------------------------------------
-# Config
-# ---------------------------------------------------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+DB_PATH = os.getenv("DB_PATH", "finance_bot.db").strip() or "finance_bot.db"
+WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
-DB_PATH = os.getenv("DB_PATH", "finance_bot.db").strip()
-TIMEZONE_NAME = os.getenv("BOT_TIMEZONE", os.getenv("TIMEZONE", "Asia/Tashkent")).strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile"
 DEFAULT_USD_RATE = Decimal(os.getenv("DEFAULT_USD_RATE", "12750").strip() or "12750")
+TIMEZONE_NAME = os.getenv("BOT_TIMEZONE", "Asia/Tashkent").strip() or "Asia/Tashkent"
 ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
+    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
 }
-CBU_USD_API = os.getenv("CBU_USD_API", "https://cbu.uz/uz/arkhiv-kursov-valyut/json/USD/").strip()
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper().strip()
 
-try:
-    TZ = ZoneInfo(TIMEZONE_NAME)
-except ZoneInfoNotFoundError:
+if not BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN topilmadi")
+
+if ZoneInfo is not None:
+    try:
+        TZ = ZoneInfo(TIMEZONE_NAME)
+    except ZoneInfoNotFoundError:
+        TZ = timezone(timedelta(hours=5))
+else:
     TZ = timezone(timedelta(hours=5))
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-log = logging.getLogger("finance_bot")
+logger = logging.getLogger("finance-bot")
 
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
-dp = Dispatcher(bot, storage=MemoryStorage())
+storage = MemoryStorage()
+dp = Dispatcher(bot, storage=storage)
 
-PENDING_BATCHES: Dict[str, Dict[str, Any]] = {}
+CBU_USD_URL = "https://cbu.uz/uz/arkhiv-kursov-valyut/json/USD/"
+EXPORT_LINE_RE = re.compile(
+    r"^\[(?P<dt>\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})\]\s*(?P<author>[^:]+):\s*(?P<text>.+)$"
+)
 
-# ---------------------------------------------------------
-# State
-# ---------------------------------------------------------
+AMOUNT_RE = re.compile(
+    r"(?P<sign>[+-]?)\s*(?P<number>\d+(?:[\s,]\d{3})*(?:[.,]\d+)?|\d+(?:[.,]\d+)?)\s*(?P<unit>mln|million|ming|k|usd|\$|sum|som|so['’`]?m)?",
+    re.IGNORECASE,
+)
+
+STOPWORDS = {
+    "aka", "opa", "uchun", "ga", "dan", "va", "bilan", "berdim", "oldim", "olindi",
+    "predoplata", "dokumentiga", "labo", "labosiga", "xizmat", "sum", "so'm", "som", "usd"
+}
+
+
 class RateStates(StatesGroup):
     waiting_manual_rate = State()
 
 
-# ---------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------
+class DeleteStates(StatesGroup):
+    waiting_record_id = State()
+
+
 @dataclass
-class ParsedItem:
-    tx_type: str               # income | expense
-    amount_original: str       # original numeric string
-    currency: str              # UZS | USD
-    amount_uzs: int            # normalized to UZS
+class ParsedRecord:
+    tx_type: str
+    amount_uzs: int
+    currency: str
+    amount_original: str
+    usd_rate_used: str
     description: str
-    category: str
-    counterparty: str
-    author: str
-    tx_at: str                 # ISO string
-    source_line: str
-    raw_text: str
-    sign: str
+    author_name: str
+    tx_at: str
+    source_text: str
+    source_kind: str
+    meta_json: str = "{}"
+    category: str = "boshqa"
+    counterparty: str = ""
 
 
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
-def now_local() -> datetime:
+@dataclass
+class PendingBatch:
+    owner_id: int
+    source_text: str
+    created_at: str
+    summary_text: str
+    items: List[ParsedRecord] = field(default_factory=list)
+
+
+def now_tz() -> datetime:
     return datetime.now(TZ)
 
 
-def fmt_dt(dt: datetime) -> str:
-    return dt.astimezone(TZ).strftime("%d.%m.%Y %H:%M")
+def now_iso() -> str:
+    return now_tz().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def parse_iso_to_local_text(value: Optional[str]) -> str:
-    if not value:
-        return "-"
+def display_dt(value: str) -> str:
     try:
-        dt = datetime.fromisoformat(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ)
-        return fmt_dt(dt)
+        dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        return dt.strftime("%d.%m.%Y %H:%M")
     except Exception:
         return value
 
 
-def money_fmt(value: int | float | Decimal) -> str:
+def money_fmt_uzs(value: Any) -> str:
     try:
-        n = int(round(float(value)))
+        dec = Decimal(str(value))
     except Exception:
-        n = 0
-    s = f"{n:,}".replace(",", " ")
-    return f"{s} so'm"
+        dec = Decimal("0")
+    q = dec.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return f"{int(q):,}".replace(",", " ") + " so‘m"
 
 
-def compact_money(value: int | float | Decimal) -> str:
+def money_fmt_decimal(value: Any) -> str:
     try:
-        n = int(round(float(value)))
+        dec = Decimal(str(value))
     except Exception:
-        n = 0
-    negative = n < 0
-    n = abs(n)
-    if n >= 1_000_000_000:
-        out = f"{n / 1_000_000_000:.2f} mlrd"
-    elif n >= 1_000_000:
-        out = f"{n / 1_000_000:.2f} mln"
-    elif n >= 1_000:
-        out = f"{n / 1_000:.2f} ming"
-    else:
-        out = str(n)
-    return f"- {out}" if negative else out
+        dec = Decimal("0")
+    s = format(dec.normalize(), "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
 
 
-def sanitize_text(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "")).strip()
-
-
-def strip_command_prefix(text: str) -> str:
-    text = (text or "").strip()
-    if text.startswith("/"):
-        return ""
-    return text
-
-
-def start_of_day(dt: Optional[datetime] = None) -> datetime:
-    dt = dt or now_local()
-    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-def start_of_week(dt: Optional[datetime] = None) -> datetime:
-    dt = dt or now_local()
-    base = start_of_day(dt)
-    return base - timedelta(days=base.weekday())
-
-
-def start_of_month(dt: Optional[datetime] = None) -> datetime:
-    dt = dt or now_local()
-    return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-
-def parse_dt_guess(text: Optional[str]) -> datetime:
-    if not text:
-        return now_local()
-    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y %H:%M:%S"):
-        with suppress(Exception):
-            return datetime.strptime(text, fmt).replace(tzinfo=TZ)
-    return now_local()
-
-
-def ensure_note_quality(note: str, source_text: str) -> str:
-    note = sanitize_text(note)
-    if note:
-        return note
-    source_text = sanitize_text(source_text)
-    if source_text:
-        return source_text[:180]
-    return "Izoh kiritilmagan"
-
-
-def deduce_category(text: str) -> str:
-    t = sanitize_text(text).lower()
-    rules = [
-        ("dokument", "Hujjat"),
-        ("dostav", "Dostavka"),
-        ("temir", "Temir / material"),
-        ("metan", "Gaz / metan"),
-        ("resor", "Xizmat / ta'mirlash"),
-        ("xizmat", "Xizmat / ta'mirlash"),
-        ("avans", "Avans"),
-        ("predopl", "Oldindan to'lov"),
-        ("opl", "To'lov / olib kelish"),
-        ("labo", "Avto / labo"),
-        ("nikel", "Qo'shimcha ish"),
-        ("ber", "To'lov / berildi"),
-        ("olindi", "Tushum"),
-    ]
-    for key, cat in rules:
-        if key in t:
-            return cat
-    return "Boshqa"
-
-
-def deduce_counterparty(text: str) -> str:
-    raw = sanitize_text(text)
-    low = raw.lower()
-    patterns = [
-        r"([A-Za-zА-Яа-яЁёʻ’'`\-]+\s+(?:aka|oka|ustoz|dost|do'st))",
-        r"([A-Za-zА-Яа-яЁёʻ’'`\-]+)\s+(?:aka|oka)",
-        r"\b(azam|orif|xusniddin|serik|saidmannapovich)\b",
-    ]
-    for p in patterns:
-        m = re.search(p, raw, re.IGNORECASE)
+def parse_export_or_plain(raw_text: str) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for line in (raw_text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = EXPORT_LINE_RE.match(line)
         if m:
-            return sanitize_text(m.group(1))[:80]
-    # First 1-2 words before a keyword
-    m = re.search(r"^([\wʻ’'`-]+(?:\s+[\wʻ’'`-]+){0,2})\s+(?:labo|xizmat|dostavka|avans|ber|olindi)", raw, re.IGNORECASE)
-    if m:
-        return sanitize_text(m.group(1))[:80]
-    return ""
+            rows.append({
+                "author": m.group("author").strip(),
+                "text": m.group("text").strip(),
+                "dt": m.group("dt").strip(),
+                "kind": "telegram_export",
+                "raw_line": line,
+            })
+        else:
+            rows.append({
+                "author": "",
+                "text": line,
+                "dt": "",
+                "kind": "plain_text",
+                "raw_line": line,
+            })
+    return rows
 
 
-async def maybe_ai_enrich(note: str) -> Tuple[str, str, str]:
-    """Return improved_note, category, counterparty. Fallback to heuristics."""
-    base_note = ensure_note_quality(note, note)
-    base_category = deduce_category(base_note)
-    base_counterparty = deduce_counterparty(base_note)
+def clean_number(num: str) -> Decimal:
+    s = num.strip().replace(" ", "")
+    if "," in s and "." in s:
+        s = s.replace(",", "")
+    elif "," in s:
+        parts = s.split(",")
+        if len(parts) > 1 and all(len(p) == 3 for p in parts[1:]):
+            s = "".join(parts)
+        else:
+            s = s.replace(",", ".")
+    return Decimal(s)
 
-    if not GROQ_API_KEY:
-        return base_note, base_category, base_counterparty
 
-    prompt = (
-        "Sen moliyaviy yozuvlardan izoh, kategoriya va kontragentni ajratuvchi yordamchisan. "
-        "Faqat JSON qaytar. JSON format: "
-        '{"note":"...", "category":"...", "counterparty":"..."}. '
-        "Izoh juda qisqa emas, aniq va ishbilarmon bo'lsin. Kategoriya 2-4 so'zdan oshmasin. "
-        "Matn: " + base_note
-    )
+def detect_category_and_counterparty(description: str) -> Tuple[str, str]:
+    text = description.lower()
+    category = "boshqa"
+    if any(k in text for k in ["dostav", "yetkaz", "transport"]):
+        category = "dostavka"
+    elif any(k in text for k in ["dokument", "hujjat"]):
+        category = "dokument"
+    elif any(k in text for k in ["avans", "predoplata", "oldindan"]):
+        category = "avans"
+    elif any(k in text for k in ["metan", "resor", "nikel", "temir", "labo", "xizmat"]):
+        category = "xizmat"
+    elif any(k in text for k in ["olindi", "kelib tushdi", "keldi"]):
+        category = "kirim"
+    elif any(k in text for k in ["berdim", "to'ladim", "to‘ladim", "chiqdi"]):
+        category = "chiqim"
 
+    tokens = [t for t in re.findall(r"[\w‘’'-]+", description, flags=re.UNICODE) if t]
+    counterparty = ""
+    candidates = []
+    for i, tok in enumerate(tokens):
+        low = tok.lower()
+        if low in STOPWORDS or low.isdigit() or len(low) < 3:
+            continue
+        candidates.append(tok)
+        if len(candidates) >= 2:
+            break
+    if candidates:
+        counterparty = " ".join(candidates)
+    return category, counterparty
+
+
+async def maybe_ai_enrich(description: str) -> Tuple[str, str, str]:
+    if not GROQ_API_KEY or not description.strip():
+        category, cp = detect_category_and_counterparty(description)
+        return description.strip(), category, cp
+
+    payload = {
+        "model": GROQ_MODEL,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Sen moliyaviy yozuvlarni tozalovchi yordamchisan. "
+                    "Qisqa, aniq JSON qaytar: {\"description\": str, \"category\": str, \"counterparty\": str}."
+                ),
+            },
+            {
+                "role": "user",
+                "content": description[:1200],
+            },
+        ],
+    }
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": "Doim faqat yaroqli JSON qaytar."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"},
-    }
-
     try:
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=18)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers=headers,
                 json=payload,
             ) as resp:
-                resp.raise_for_status()
+                if resp.status >= 400:
+                    raise RuntimeError(f"Groq {resp.status}")
                 data = await resp.json()
         content = data["choices"][0]["message"]["content"]
-        obj = json.loads(content)
-        note = ensure_note_quality(obj.get("note") or base_note, base_note)
-        category = sanitize_text(obj.get("category") or base_category)[:80] or base_category
-        counterparty = sanitize_text(obj.get("counterparty") or base_counterparty)[:80]
-        return note, category, counterparty
-    except Exception as e:
-        log.warning("AI enrich fallback: %s", e)
-        return base_note, base_category, base_counterparty
+        parsed = json.loads(content)
+        description2 = str(parsed.get("description") or description).strip()
+        category = str(parsed.get("category") or "boshqa").strip().lower()
+        counterparty = str(parsed.get("counterparty") or "").strip()
+        return description2, category or "boshqa", counterparty
+    except Exception:
+        category, cp = detect_category_and_counterparty(description)
+        return description.strip(), category, cp
 
 
-# ---------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------
-EXPORT_LINE_RE = re.compile(
-    r"^\[(?P<dt>\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2})\]\s*(?P<author>[^:]+):\s*(?P<text>.+)$"
-)
-
-AMOUNT_RE = re.compile(
-    r"(?P<sign>[+-]?)\s*"
-    r"(?P<number>(?:\d{1,3}(?:[\s,]\d{3})+|\d+)(?:[.,]\d+)?)\s*"
-    r"(?P<unit>mln|million|ming|k|usd|\$|sum|som|so'm|s[oʻ'’]m)?",
-    re.IGNORECASE,
-)
-
-
-def parse_input_lines(raw_text: str) -> List[Dict[str, str | None]]:
-    rows: List[Dict[str, str | None]] = []
-    raw_text = (raw_text or "").strip()
-    if not raw_text:
-        return rows
-
-    for line in raw_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        m = EXPORT_LINE_RE.match(line)
-        if m:
-            rows.append(
-                {
-                    "author": sanitize_text(m.group("author")),
-                    "text": sanitize_text(m.group("text")),
-                    "dt": sanitize_text(m.group("dt")),
-                    "source_type": "telegram_export",
-                    "source_line": line,
-                }
-            )
-        else:
-            rows.append(
-                {
-                    "author": "",
-                    "text": sanitize_text(line),
-                    "dt": None,
-                    "source_type": "plain_text",
-                    "source_line": line,
-                }
-            )
-    return rows
-
-
-def normalize_amount(number_str: str, unit: str | None, usd_rate: Decimal) -> Tuple[str, int, str]:
-    raw = sanitize_text(number_str).replace(" ", "")
-    # 12,750 -> 12750 ; 12.5 -> 12.5 ; 12,5 -> 12.5
-    if "," in raw and "." not in raw:
-        parts = raw.split(",")
-        if len(parts) > 1 and all(len(p) == 3 for p in parts[1:]) and len(parts[0]) <= 3:
-            raw = "".join(parts)
-        else:
-            raw = raw.replace(",", ".")
-    raw = raw.replace(",", "")
-    value = Decimal(raw)
-    unit_norm = (unit or "").lower().strip()
-
-    if unit_norm in {"mln", "million"}:
-        uzs = int((value * Decimal("1000000")).quantize(Decimal("1")))
-        return str(value), uzs, "UZS"
-    if unit_norm in {"ming", "k"}:
-        uzs = int((value * Decimal("1000")).quantize(Decimal("1")))
-        return str(value), uzs, "UZS"
-    if unit_norm in {"usd", "$"}:
-        uzs = int((value * usd_rate).quantize(Decimal("1")))
-        return str(value), uzs, "USD"
-    # plain amount -> UZS
-    uzs = int(value.quantize(Decimal("1")))
-    return str(value), uzs, "UZS"
-
-
-async def parse_transactions_from_text(
-    text: str,
-    usd_rate: Decimal,
-    author: str = "",
-    source_dt: Optional[str] = None,
-    raw_line: str = "",
-) -> List[ParsedItem]:
-    text = sanitize_text(text)
-    if not text:
-        return []
-
-    matches = [m for m in AMOUNT_RE.finditer(text) if m.group("number")]
-    if not matches:
-        return []
-
-    tx_at = parse_dt_guess(source_dt).isoformat()
-    tail_after_last = text[matches[-1].end():].strip(" -+.,;:")
-
-    items: List[ParsedItem] = []
-    for idx, m in enumerate(matches):
-        sign = (m.group("sign") or "").strip()
-        number = m.group("number")
-        unit = m.group("unit")
-        try:
-            original, amount_uzs, currency = normalize_amount(number, unit, usd_rate)
-        except Exception:
-            continue
-
-        tx_type = "income" if sign == "+" else "expense"
-        segment_start = m.end()
-        segment_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-        note_segment = text[segment_start:segment_end].strip(" -+.,;:")
-        if not note_segment:
-            note_segment = tail_after_last
-        note = ensure_note_quality(note_segment, text)
-        note, category, counterparty = await maybe_ai_enrich(note)
-
-        items.append(
-            ParsedItem(
-                tx_type=tx_type,
-                amount_original=original,
-                currency=currency,
-                amount_uzs=amount_uzs,
-                description=note,
-                category=category,
-                counterparty=counterparty,
-                author=author,
-                tx_at=tx_at,
-                source_line=raw_line or text,
-                raw_text=text,
-                sign=sign or "-",
-            )
-        )
-
-    # If all notes identical and there is a richer full text, keep it but not noisy.
-    return items
-
-
-# ---------------------------------------------------------
-# Database
-# ---------------------------------------------------------
-CREATE_TRANSACTIONS_SQL = """
-CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    batch_id INTEGER,
-    tx_type TEXT NOT NULL,
-    amount_original TEXT NOT NULL DEFAULT '',
-    currency TEXT NOT NULL DEFAULT 'UZS',
-    amount_uzs INTEGER NOT NULL DEFAULT 0,
-    description TEXT NOT NULL DEFAULT '',
-    category TEXT NOT NULL DEFAULT '',
-    counterparty TEXT NOT NULL DEFAULT '',
-    author TEXT NOT NULL DEFAULT '',
-    tx_at TEXT NOT NULL,
-    source_line TEXT NOT NULL DEFAULT '',
-    raw_text TEXT NOT NULL DEFAULT '',
-    sign TEXT NOT NULL DEFAULT '-',
-    created_at TEXT NOT NULL,
-    is_deleted INTEGER NOT NULL DEFAULT 0,
-    deleted_at TEXT,
-    deleted_reason TEXT NOT NULL DEFAULT ''
-);
-"""
-
-CREATE_BATCHES_SQL = """
-CREATE TABLE IF NOT EXISTS batches (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_text TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL,
-    saved_at TEXT NOT NULL,
-    summary_text TEXT NOT NULL DEFAULT '',
-    item_count INTEGER NOT NULL DEFAULT 0,
-    income_total_uzs INTEGER NOT NULL DEFAULT 0,
-    expense_total_uzs INTEGER NOT NULL DEFAULT 0,
-    net_total_uzs INTEGER NOT NULL DEFAULT 0,
-    undone_at TEXT,
-    is_deleted INTEGER NOT NULL DEFAULT 0,
-    deleted_reason TEXT NOT NULL DEFAULT ''
-);
-"""
-
-CREATE_SETTINGS_SQL = """
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL DEFAULT ''
-);
-"""
+async def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS if ADMIN_IDS else True
 
 
 async def ensure_column(db: aiosqlite.Connection, table: str, column: str, decl: str) -> None:
     cur = await db.execute(f"PRAGMA table_info({table})")
-    rows = await cur.fetchall()
-    cols = {r[1] for r in rows}
+    cols = {row[1] for row in await cur.fetchall()}
     if column not in cols:
         await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript(CREATE_TRANSACTIONS_SQL)
-        await db.executescript(CREATE_BATCHES_SQL)
-        await db.executescript(CREATE_SETTINGS_SQL)
+        await db.executescript(
+            """
+            PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
 
-        tx_columns = [
-            ("batch_id", "INTEGER"),
-            ("tx_type", "TEXT NOT NULL DEFAULT 'expense'"),
-            ("amount_original", "TEXT NOT NULL DEFAULT ''"),
-            ("currency", "TEXT NOT NULL DEFAULT 'UZS'"),
-            ("amount_uzs", "INTEGER NOT NULL DEFAULT 0"),
-            ("description", "TEXT NOT NULL DEFAULT ''"),
-            ("category", "TEXT NOT NULL DEFAULT ''"),
-            ("counterparty", "TEXT NOT NULL DEFAULT ''"),
-            ("author", "TEXT NOT NULL DEFAULT ''"),
-            ("tx_at", "TEXT NOT NULL DEFAULT ''"),
-            ("source_line", "TEXT NOT NULL DEFAULT ''"),
-            ("raw_text", "TEXT NOT NULL DEFAULT ''"),
-            ("sign", "TEXT NOT NULL DEFAULT '-'"),
-            ("created_at", "TEXT NOT NULL DEFAULT ''"),
-            ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
-            ("deleted_at", "TEXT"),
-            ("deleted_reason", "TEXT NOT NULL DEFAULT ''"),
-        ]
-        batch_columns = [
+            CREATE TABLE IF NOT EXISTS batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_id INTEGER NOT NULL,
+                source_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '',
+                saved_at TEXT NOT NULL DEFAULT '',
+                summary_text TEXT NOT NULL DEFAULT '',
+                item_count INTEGER NOT NULL DEFAULT 0,
+                income_total_uzs INTEGER NOT NULL DEFAULT 0,
+                expense_total_uzs INTEGER NOT NULL DEFAULT 0,
+                net_total_uzs INTEGER NOT NULL DEFAULT 0,
+                undone_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                owner_id INTEGER NOT NULL,
+                tx_type TEXT NOT NULL,
+                amount_uzs INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                amount_original TEXT NOT NULL,
+                usd_rate_used TEXT NOT NULL,
+                description TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'boshqa',
+                counterparty TEXT NOT NULL DEFAULT '',
+                author_name TEXT NOT NULL DEFAULT '',
+                tx_at TEXT NOT NULL,
+                source_text TEXT NOT NULL DEFAULT '',
+                source_kind TEXT NOT NULL DEFAULT 'plain_text',
+                meta_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT '',
+                deleted_at TEXT,
+                FOREIGN KEY(batch_id) REFERENCES batches(id)
+            );
+            """
+        )
+        for column, decl in [
             ("source_text", "TEXT NOT NULL DEFAULT ''"),
             ("created_at", "TEXT NOT NULL DEFAULT ''"),
             ("saved_at", "TEXT NOT NULL DEFAULT ''"),
@@ -512,49 +348,46 @@ async def init_db() -> None:
             ("expense_total_uzs", "INTEGER NOT NULL DEFAULT 0"),
             ("net_total_uzs", "INTEGER NOT NULL DEFAULT 0"),
             ("undone_at", "TEXT"),
-            ("is_deleted", "INTEGER NOT NULL DEFAULT 0"),
-            ("deleted_reason", "TEXT NOT NULL DEFAULT ''"),
-        ]
-        for col, decl in tx_columns:
-            await ensure_column(db, "transactions", col, decl)
-        for col, decl in batch_columns:
-            await ensure_column(db, "batches", col, decl)
+        ]:
+            await ensure_column(db, "batches", column, decl)
 
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_transactions_tx_at ON transactions(tx_at)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_transactions_batch_id ON transactions(batch_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_transactions_deleted ON transactions(is_deleted)")
+        for column, decl in [
+            ("category", "TEXT NOT NULL DEFAULT 'boshqa'"),
+            ("counterparty", "TEXT NOT NULL DEFAULT ''"),
+            ("author_name", "TEXT NOT NULL DEFAULT ''"),
+            ("source_text", "TEXT NOT NULL DEFAULT ''"),
+            ("source_kind", "TEXT NOT NULL DEFAULT 'plain_text'"),
+            ("meta_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("created_at", "TEXT NOT NULL DEFAULT ''"),
+            ("deleted_at", "TEXT"),
+        ]:
+            await ensure_column(db, "transactions", column, decl)
 
-        await set_setting_db(db, "usd_rate", str(DEFAULT_USD_RATE), commit=False, only_if_missing=True)
-        await set_setting_db(db, "live_reset_at", start_of_day().isoformat(), commit=False, only_if_missing=True)
-        await db.commit()
-
-
-async def set_setting_db(
-    db: aiosqlite.Connection,
-    key: str,
-    value: str,
-    *,
-    commit: bool = False,
-    only_if_missing: bool = False,
-) -> None:
-    if only_if_missing:
-        cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = await cur.fetchone()
-        if row is not None:
-            return
-    await db.execute(
-        "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
-        (key, value),
-    )
-    if commit:
+        await db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('usd_rate', ?)",
+            (str(DEFAULT_USD_RATE),),
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('current_period_start', ?)",
+            (now_iso(),),
+        )
         await db.commit()
 
 
 async def get_setting(key: str, default: str = "") -> str:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        cur = await db.execute("SELECT value FROM settings WHERE key=?", (key,))
         row = await cur.fetchone()
-        return row[0] if row else default
+    return row[0] if row else default
+
+
+async def set_setting(key: str, value: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO settings(key, value) VALUES(?, ?)",
+            (key, value),
+        )
+        await db.commit()
 
 
 async def get_usd_rate() -> Decimal:
@@ -565,864 +398,828 @@ async def get_usd_rate() -> Decimal:
         return DEFAULT_USD_RATE
 
 
-async def set_usd_rate(value: Decimal, source: str) -> None:
+async def fetch_cbu_usd_rate() -> Tuple[Decimal, str]:
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(CBU_USD_URL) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("CBU API bo‘sh javob qaytardi")
+    item = data[0]
+    rate = Decimal(str(item.get("Rate", "0")).replace(",", "."))
+    dt = str(item.get("Date", "")).strip()
+    return rate, dt
+
+
+async def get_current_period_start() -> str:
+    return await get_setting("current_period_start", now_iso())
+
+
+async def reset_current_period() -> str:
+    ts = now_iso()
+    await set_setting("current_period_start", ts)
+    return ts
+
+
+async def count_active_transactions() -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        await set_setting_db(db, "usd_rate", str(value), commit=False)
-        await set_setting_db(db, "usd_rate_source", source, commit=False)
-        await set_setting_db(db, "usd_rate_updated_at", now_local().isoformat(), commit=False)
-        await db.commit()
+        cur = await db.execute("SELECT COUNT(*) FROM transactions WHERE deleted_at IS NULL")
+        row = await cur.fetchone()
+        return int(row[0] or 0)
 
 
-async def get_live_reset_at() -> datetime:
-    raw = await get_setting("live_reset_at", start_of_day().isoformat())
-    try:
-        dt = datetime.fromisoformat(raw)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ)
-        return dt.astimezone(TZ)
-    except Exception:
-        return start_of_day()
+async def parse_text_to_records(raw_text: str, default_author: str) -> List[ParsedRecord]:
+    rows = parse_export_or_plain(raw_text)
+    if not rows:
+        return []
+    usd_rate = await get_usd_rate()
+    records: List[ParsedRecord] = []
+    for row in rows:
+        text = row["text"]
+        matches = list(AMOUNT_RE.finditer(text))
+        matches = [m for m in matches if m.group("number")]
+        if not matches:
+            continue
+        for idx, m in enumerate(matches):
+            sign = (m.group("sign") or "").strip()
+            try:
+                number = clean_number(m.group("number"))
+            except Exception:
+                continue
+            unit = (m.group("unit") or "").lower().strip()
+            currency = "UZS"
+            amount_uzs = Decimal("0")
+            amount_original = number
+            if unit in {"mln", "million"}:
+                amount_uzs = number * Decimal("1000000")
+            elif unit in {"ming", "k"}:
+                amount_uzs = number * Decimal("1000")
+            elif unit in {"usd", "$"}:
+                currency = "USD"
+                amount_uzs = number * usd_rate
+            else:
+                amount_uzs = number
+
+            tx_type = "income" if sign == "+" else "expense"
+            seg_start = m.end()
+            seg_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+            desc = text[seg_start:seg_end].strip(" -+.,;:") or text.strip()
+            desc2, category, cp = await maybe_ai_enrich(desc)
+
+            tx_at = row["dt"]
+            if tx_at:
+                try:
+                    tx_at2 = datetime.strptime(tx_at, "%d.%m.%Y %H:%M")
+                    tx_at_str = tx_at2.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    tx_at_str = now_iso()
+            else:
+                tx_at_str = now_iso()
+
+            records.append(
+                ParsedRecord(
+                    tx_type=tx_type,
+                    amount_uzs=int(amount_uzs.quantize(Decimal("1"), rounding=ROUND_HALF_UP)),
+                    currency=currency,
+                    amount_original=money_fmt_decimal(amount_original),
+                    usd_rate_used=money_fmt_decimal(usd_rate),
+                    description=desc2 or desc,
+                    author_name=row["author"] or default_author,
+                    tx_at=tx_at_str,
+                    source_text=row["raw_line"],
+                    source_kind=row["kind"],
+                    category=category,
+                    counterparty=cp,
+                    meta_json=json.dumps({"unit": unit, "sign": sign}, ensure_ascii=False),
+                )
+            )
+    return records
 
 
-async def reset_live_period() -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await set_setting_db(db, "live_reset_at", now_local().isoformat(), commit=True)
+def summarize_records(items: List[ParsedRecord]) -> Tuple[str, int, int, int]:
+    income = sum(x.amount_uzs for x in items if x.tx_type == "income")
+    expense = sum(x.amount_uzs for x in items if x.tx_type == "expense")
+    net = income - expense
+    parts = [
+        f"Yozuvlar: {len(items)} ta",
+        f"Kirim: {money_fmt_uzs(income)}",
+        f"Chiqim: {money_fmt_uzs(expense)}",
+        f"Qoldiq: {money_fmt_uzs(net)}",
+    ]
+    return "\n".join(parts), income, expense, net
 
 
-async def save_pending_batch(pending: Dict[str, Any]) -> int:
-    created_at = now_local().isoformat()
-    items: List[ParsedItem] = pending["items"]
-    income_total = sum(x.amount_uzs for x in items if x.tx_type == "income")
-    expense_total = sum(x.amount_uzs for x in items if x.tx_type == "expense")
-    net_total = income_total - expense_total
-    summary_text = pending.get("summary_text") or ""
-    source_text = pending.get("source_text") or ""
+async def build_preview_text(items: List[ParsedRecord], source_text: str) -> str:
+    summary, income, expense, net = summarize_records(items)
+    lines = ["<b>Preview</b>", summary, "", "<b>Yozuvlar:</b>"]
+    for idx, x in enumerate(items[:20], 1):
+        sign = "+" if x.tx_type == "income" else "-"
+        orig = f"{sign}{x.amount_original} {x.currency}"
+        lines.append(
+            f"{idx}. {orig} → {money_fmt_uzs(x.amount_uzs)}\n"
+            f"   Izoh: {x.description or '-'}\n"
+            f"   Kategoriya: {x.category}\n"
+            f"   Kontragent: {x.counterparty or '-'}\n"
+            f"   Sana: {display_dt(x.tx_at)}"
+        )
+    if len(items) > 20:
+        lines.append(f"... va yana {len(items) - 20} ta yozuv")
+    lines.append("")
+    lines.append("<b>Asl matn:</b>")
+    lines.append(source_text[:3000])
+    return "\n".join(lines)
 
+
+async def save_pending_batch(pending: PendingBatch) -> int:
+    summary_text, income, expense, net = summarize_records(pending.items)
+    saved_at = now_iso()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
             INSERT INTO batches(
-                source_text, created_at, saved_at, summary_text,
-                item_count, income_total_uzs, expense_total_uzs, net_total_uzs,
-                undone_at, is_deleted, deleted_reason
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, '')
+                owner_id, source_text, created_at, saved_at, summary_text,
+                item_count, income_total_uzs, expense_total_uzs, net_total_uzs, undone_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             """,
             (
-                source_text,
-                created_at,
-                created_at,
+                pending.owner_id,
+                pending.source_text,
+                pending.created_at,
+                saved_at,
                 summary_text,
-                len(items),
-                income_total,
-                expense_total,
-                net_total,
+                len(pending.items),
+                income,
+                expense,
+                net,
             ),
         )
-        batch_id = cur.lastrowid
-
-        for item in items:
+        batch_id = int(cur.lastrowid)
+        for x in pending.items:
             await db.execute(
                 """
                 INSERT INTO transactions(
-                    batch_id, tx_type, amount_original, currency, amount_uzs,
-                    description, category, counterparty, author, tx_at,
-                    source_line, raw_text, sign, created_at, is_deleted,
-                    deleted_at, deleted_reason
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, '')
+                    batch_id, owner_id, tx_type, amount_uzs, currency, amount_original,
+                    usd_rate_used, description, category, counterparty, author_name,
+                    tx_at, source_text, source_kind, meta_json, created_at, deleted_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 """,
                 (
                     batch_id,
-                    item.tx_type,
-                    item.amount_original,
-                    item.currency,
-                    item.amount_uzs,
-                    item.description,
-                    item.category,
-                    item.counterparty,
-                    item.author,
-                    item.tx_at,
-                    item.source_line,
-                    item.raw_text,
-                    item.sign,
-                    created_at,
+                    pending.owner_id,
+                    x.tx_type,
+                    x.amount_uzs,
+                    x.currency,
+                    x.amount_original,
+                    x.usd_rate_used,
+                    x.description,
+                    x.category,
+                    x.counterparty,
+                    x.author_name,
+                    x.tx_at,
+                    x.source_text,
+                    x.source_kind,
+                    x.meta_json,
+                    saved_at,
                 ),
             )
         await db.commit()
-    return int(batch_id)
+    return batch_id
 
 
-async def undo_last_batch() -> Optional[Tuple[int, int]]:
+async def undo_last_batch(owner_id: int) -> Optional[int]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id FROM batches WHERE undone_at IS NULL AND is_deleted = 0 ORDER BY id DESC LIMIT 1"
+            """
+            SELECT id FROM batches
+            WHERE owner_id=? AND undone_at IS NULL
+            ORDER BY id DESC LIMIT 1
+            """,
+            (owner_id,),
         )
         row = await cur.fetchone()
         if not row:
             return None
         batch_id = int(row[0])
-        undone_at = now_local().isoformat()
-        await db.execute(
-            "UPDATE batches SET undone_at = ?, is_deleted = 1, deleted_reason = 'undo' WHERE id = ?",
-            (undone_at, batch_id),
-        )
-        await db.execute(
-            "UPDATE transactions SET is_deleted = 1, deleted_at = ?, deleted_reason = 'undo' WHERE batch_id = ?",
-            (undone_at, batch_id),
-        )
-        cur = await db.execute("SELECT COUNT(*) FROM transactions WHERE batch_id = ?", (batch_id,))
-        cnt = int((await cur.fetchone())[0])
+        ts = now_iso()
+        await db.execute("UPDATE batches SET undone_at=? WHERE id=?", (ts, batch_id))
+        await db.execute("UPDATE transactions SET deleted_at=? WHERE batch_id=? AND deleted_at IS NULL", (ts, batch_id))
         await db.commit()
-        return batch_id, cnt
+        return batch_id
 
 
-async def get_recent_transactions(limit: int = 10) -> List[Dict[str, Any]]:
+async def fetch_totals(period: str) -> Dict[str, Any]:
+    now = now_tz()
+    if period == "today":
+        start = datetime(now.year, now.month, now.day, tzinfo=TZ)
+    elif period == "week":
+        start = datetime(now.year, now.month, now.day, tzinfo=TZ) - timedelta(days=now.weekday())
+    elif period == "month":
+        start = datetime(now.year, now.month, 1, tzinfo=TZ)
+    elif period == "live":
+        raw = await get_current_period_start()
+        try:
+            start = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+        except Exception:
+            start = now
+    else:
+        start = datetime(1970, 1, 1, tzinfo=TZ)
+    start_s = start.strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            """
-            SELECT * FROM transactions
-            WHERE is_deleted = 0
-            ORDER BY datetime(tx_at) DESC, id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        )
-        return [dict(r) for r in await cur.fetchall()]
-
-
-async def fetch_period_summary(start_dt: datetime, end_dt: Optional[datetime] = None) -> Dict[str, Any]:
-    start_iso = start_dt.isoformat()
-    end_iso = (end_dt or now_local()).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
         cur = await db.execute(
             """
             SELECT
-                COUNT(*) AS count_all,
-                COALESCE(SUM(CASE WHEN tx_type='income' THEN amount_uzs ELSE 0 END), 0) AS income_total,
-                COALESCE(SUM(CASE WHEN tx_type='expense' THEN amount_uzs ELSE 0 END), 0) AS expense_total
+              COALESCE(SUM(CASE WHEN tx_type='income' THEN amount_uzs ELSE 0 END),0),
+              COALESCE(SUM(CASE WHEN tx_type='expense' THEN amount_uzs ELSE 0 END),0),
+              COUNT(*)
             FROM transactions
-            WHERE is_deleted = 0 AND datetime(tx_at) >= datetime(?) AND datetime(tx_at) <= datetime(?)
+            WHERE deleted_at IS NULL AND tx_at >= ?
             """,
-            (start_iso, end_iso),
+            (start_s,),
         )
-        base = dict(await cur.fetchone())
-
-        cur = await db.execute(
-            """
-            SELECT category, COUNT(*) AS cnt, COALESCE(SUM(amount_uzs), 0) AS total
-            FROM transactions
-            WHERE is_deleted = 0 AND tx_type='expense'
-              AND datetime(tx_at) >= datetime(?) AND datetime(tx_at) <= datetime(?)
-            GROUP BY category
-            ORDER BY total DESC, cnt DESC
-            LIMIT 5
-            """,
-            (start_iso, end_iso),
-        )
-        expense_categories = [dict(r) for r in await cur.fetchall()]
-
-        cur = await db.execute(
-            """
-            SELECT category, COUNT(*) AS cnt, COALESCE(SUM(amount_uzs), 0) AS total
-            FROM transactions
-            WHERE is_deleted = 0 AND tx_type='income'
-              AND datetime(tx_at) >= datetime(?) AND datetime(tx_at) <= datetime(?)
-            GROUP BY category
-            ORDER BY total DESC, cnt DESC
-            LIMIT 5
-            """,
-            (start_iso, end_iso),
-        )
-        income_categories = [dict(r) for r in await cur.fetchall()]
-
-        cur = await db.execute(
-            """
-            SELECT * FROM transactions
-            WHERE is_deleted = 0 AND datetime(tx_at) >= datetime(?) AND datetime(tx_at) <= datetime(?)
-            ORDER BY datetime(tx_at) DESC, id DESC
-            LIMIT 10
-            """,
-            (start_iso, end_iso),
-        )
-        recent = [dict(r) for r in await cur.fetchall()]
-
-    income_total = int(base.get("income_total") or 0)
-    expense_total = int(base.get("expense_total") or 0)
+        income, expense, count = await cur.fetchone()
+    income = int(income or 0)
+    expense = int(expense or 0)
     return {
-        "count": int(base.get("count_all") or 0),
-        "income_total": income_total,
-        "expense_total": expense_total,
-        "net_total": income_total - expense_total,
-        "expense_categories": expense_categories,
-        "income_categories": income_categories,
-        "recent": recent,
-        "start_dt": start_dt,
-        "end_dt": end_dt or now_local(),
+        "start": start_s,
+        "income": income,
+        "expense": expense,
+        "net": income - expense,
+        "count": int(count or 0),
     }
 
 
-async def export_rows(start_dt: Optional[datetime] = None, end_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
-    where = ["is_deleted = 0"]
+async def recent_records(limit: int = 10, period_start: Optional[str] = None) -> List[Dict[str, Any]]:
+    query = (
+        "SELECT id, tx_at, tx_type, amount_uzs, currency, amount_original, description, category, counterparty "
+        "FROM transactions WHERE deleted_at IS NULL"
+    )
     params: List[Any] = []
-    if start_dt:
-        where.append("datetime(tx_at) >= datetime(?)")
-        params.append(start_dt.isoformat())
-    if end_dt:
-        where.append("datetime(tx_at) <= datetime(?)")
-        params.append(end_dt.isoformat())
-
-    sql = f"SELECT * FROM transactions WHERE {' AND '.join(where)} ORDER BY datetime(tx_at) ASC, id ASC"
+    if period_start:
+        query += " AND tx_at >= ?"
+        params.append(period_start)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
     async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(sql, tuple(params))
-        return [dict(r) for r in await cur.fetchall()]
+        cur = await db.execute(query, params)
+        rows = await cur.fetchall()
+    result = []
+    for r in rows:
+        result.append(
+            {
+                "id": r[0],
+                "tx_at": r[1],
+                "tx_type": r[2],
+                "amount_uzs": r[3],
+                "currency": r[4],
+                "amount_original": r[5],
+                "description": r[6],
+                "category": r[7],
+                "counterparty": r[8],
+            }
+        )
+    return result
 
 
-# ---------------------------------------------------------
-# Keyboards
-# ---------------------------------------------------------
-def main_keyboard() -> ReplyKeyboardMarkup:
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(KeyboardButton("📊 Bugun"), KeyboardButton("📅 Haftalik"), KeyboardButton("🗓 Oylik"))
-    kb.row(KeyboardButton("💱 Kursni belgilash"), KeyboardButton("📤 Export"))
-    kb.row(KeyboardButton("📝 Text hisobot"), KeyboardButton("↩️ Oxirgi amalni bekor qilish"))
-    kb.row(KeyboardButton("🔄 Yangilash"), KeyboardButton("📚 Arxiv"))
-    return kb
-
-
-def pending_keyboard(token: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("✅ Saqlash", callback_data=f"save:{token}"),
-        InlineKeyboardButton("❌ Bekor qilish", callback_data=f"cancel:{token}"),
-    )
-    return kb
-
-
-def confirm_reset_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("✅ Ha, yangilash", callback_data="reset:confirm"),
-        InlineKeyboardButton("❌ Yo'q", callback_data="reset:cancel"),
-    )
-    return kb
-
-
-def rate_menu_keyboard() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("🌐 API orqali", callback_data="rate:api_fetch"),
-        InlineKeyboardButton("⌨️ Qo'lda kiritish", callback_data="rate:manual_start"),
-    )
-    kb.add(InlineKeyboardButton("❌ Bekor", callback_data="rate:cancel"))
-    return kb
-
-
-def rate_confirm_keyboard(value: str, source: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        InlineKeyboardButton("✅ Saqlash", callback_data=f"rate:save:{value}:{source}"),
-        InlineKeyboardButton("❌ Bekor", callback_data="rate:cancel"),
-    )
-    return kb
-
-
-# ---------------------------------------------------------
-# Auth / utility
-# ---------------------------------------------------------
-async def is_admin(user_id: int) -> bool:
-    if not ADMIN_IDS:
+async def delete_record(record_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id FROM transactions WHERE id=? AND deleted_at IS NULL", (record_id,))
+        row = await cur.fetchone()
+        if not row:
+            return False
+        await db.execute("UPDATE transactions SET deleted_at=? WHERE id=?", (now_iso(), record_id))
+        await db.commit()
         return True
-    return user_id in ADMIN_IDS
 
 
-def build_preview_text(items: List[ParsedItem], usd_rate: Decimal) -> str:
-    lines = [
-        "<b>Tekshiruv preview</b>",
-        f"USD kursi: <b>{money_fmt(usd_rate)}</b>",
-        "",
-    ]
-    income = 0
-    expense = 0
-    for i, item in enumerate(items, 1):
-        emoji = "🟢" if item.tx_type == "income" else "🔴"
-        income += item.amount_uzs if item.tx_type == "income" else 0
-        expense += item.amount_uzs if item.tx_type == "expense" else 0
-        lines.extend([
-            f"{emoji} <b>{i}. {'Kirim' if item.tx_type == 'income' else 'Chiqim'}</b>",
-            f"   Summa: <b>{money_fmt(item.amount_uzs)}</b> ({item.amount_original} {item.currency})",
-            f"   Izoh: {item.description}",
-            f"   Kategoriya: {item.category}",
-            f"   Kontragent: {item.counterparty or '-'}",
-            f"   Sana: {parse_iso_to_local_text(item.tx_at)}",
-            "",
-        ])
-    lines.append(f"🟢 Jami kirim: <b>{money_fmt(income)}</b>")
-    lines.append(f"🔴 Jami chiqim: <b>{money_fmt(expense)}</b>")
-    lines.append(f"⚖️ Qoldiq: <b>{money_fmt(income - expense)}</b>")
-    lines.append("")
-    lines.append("Saqlansinmi?")
-    return "\n".join(lines)
+async def get_category_summary(period: str) -> List[Tuple[str, int]]:
+    start = (await fetch_totals(period))["start"]
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT category, COALESCE(SUM(CASE WHEN tx_type='expense' THEN amount_uzs ELSE 0 END),0) AS total
+            FROM transactions
+            WHERE deleted_at IS NULL AND tx_at >= ?
+            GROUP BY category
+            ORDER BY total DESC
+            """,
+            (start,),
+        )
+        return [(r[0] or "boshqa", int(r[1] or 0)) for r in await cur.fetchall()]
 
 
-def build_report_text(title: str, data: Dict[str, Any]) -> str:
-    lines = [
-        f"<b>{title}</b>",
-        f"Davr: {fmt_dt(data['start_dt'])} — {fmt_dt(data['end_dt'])}",
-        f"Tranzaksiya soni: <b>{data['count']}</b>",
-        f"🟢 Kirim: <b>{money_fmt(data['income_total'])}</b>",
-        f"🔴 Chiqim: <b>{money_fmt(data['expense_total'])}</b>",
-        f"⚖️ Qoldiq: <b>{money_fmt(data['net_total'])}</b>",
-        "",
-    ]
+async def export_files() -> Tuple[str, str, str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT id, tx_at, tx_type, amount_uzs, currency, amount_original, usd_rate_used,
+                   description, category, counterparty, author_name, source_kind, source_text, created_at
+            FROM transactions
+            WHERE deleted_at IS NULL
+            ORDER BY tx_at ASC, id ASC
+            """
+        )
+        rows = await cur.fetchall()
 
-    if data["income_categories"]:
-        lines.append("<b>Top kirim kategoriyalar:</b>")
-        for row in data["income_categories"]:
-            lines.append(f"• {row['category'] or 'Boshqa'} — {money_fmt(row['total'])} ({row['cnt']} ta)")
-        lines.append("")
+    ts = now_tz().strftime("%Y%m%d_%H%M%S")
+    base = Path(tempfile.gettempdir()) / f"finance_export_{ts}"
+    xlsx_path = str(base.with_suffix(".xlsx"))
+    csv_path = str(base.with_suffix(".csv"))
+    txt_path = str(base.with_suffix(".txt"))
 
-    if data["expense_categories"]:
-        lines.append("<b>Top chiqim kategoriyalar:</b>")
-        for row in data["expense_categories"]:
-            lines.append(f"• {row['category'] or 'Boshqa'} — {money_fmt(row['total'])} ({row['cnt']} ta)")
-        lines.append("")
-
-    if data["recent"]:
-        lines.append("<b>Oxirgi yozuvlar:</b>")
-        for row in data["recent"][:8]:
-            emo = "🟢" if row["tx_type"] == "income" else "🔴"
-            lines.append(
-                f"{emo} {parse_iso_to_local_text(row['tx_at'])} | {money_fmt(row['amount_uzs'])} | {row['description']}"
-            )
-    return "\n".join(lines)
-
-
-async def create_export_files(rows: List[Dict[str, Any]]) -> Tuple[io.BytesIO, io.BytesIO, io.BytesIO]:
-    # XLSX
     wb = Workbook()
     ws = wb.active
     ws.title = "Barcha"
     headers = [
-        "ID", "Batch ID", "Sana", "Turi", "Original summa", "Valyuta", "UZS summa",
-        "Izoh", "Kategoriya", "Kontragent", "Muallif", "Belgi", "Asl satr"
+        "ID", "Sana", "Turi", "UZS", "Valyuta", "Original", "USD kurs", "Izoh",
+        "Kategoriya", "Kontragent", "Muallif", "Manba turi", "Asl satr", "Yaratilgan"
     ]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center")
-    income_total = 0
-    expense_total = 0
     for row in rows:
-        if row["tx_type"] == "income":
-            income_total += int(row["amount_uzs"])
-        else:
-            expense_total += int(row["amount_uzs"])
-        ws.append([
-            row["id"], row["batch_id"], parse_iso_to_local_text(row["tx_at"]),
-            "Kirim" if row["tx_type"] == "income" else "Chiqim",
-            row["amount_original"], row["currency"], row["amount_uzs"],
-            row["description"], row["category"], row["counterparty"], row["author"],
-            row["sign"], row["source_line"],
-        ])
+        ws.append(list(row))
     for col in ws.columns:
         max_len = max(len(str(c.value or "")) for c in col)
-        ws.column_dimensions[col[0].column_letter].width = min(max(max_len + 2, 12), 42)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 40)
 
     dash = wb.create_sheet("Dashboard", 0)
-    dash["A1"] = "Ko'rsatkich"
-    dash["B1"] = "Qiymat"
+    today = await fetch_totals("today")
+    week = await fetch_totals("week")
+    month = await fetch_totals("month")
+    live = await fetch_totals("live")
+    dash_rows = [
+        ["Ko‘rsatkich", "Qiymat"],
+        ["Live qoldiq", money_fmt_uzs(live["net"])],
+        ["Bugun qoldiq", money_fmt_uzs(today["net"])],
+        ["Haftalik qoldiq", money_fmt_uzs(week["net"])],
+        ["Oylik qoldiq", money_fmt_uzs(month["net"])],
+        ["Jami yozuvlar", await count_active_transactions()],
+    ]
+    for r in dash_rows:
+        dash.append(r)
     dash["A1"].font = dash["B1"].font = Font(bold=True)
-    dash.append(["Jami yozuv", len(rows)])
-    dash.append(["Jami kirim", income_total])
-    dash.append(["Jami chiqim", expense_total])
-    dash.append(["Qoldiq", income_total - expense_total])
     dash.column_dimensions["A"].width = 24
-    dash.column_dimensions["B"].width = 20
+    dash.column_dimensions["B"].width = 24
+    wb.save(xlsx_path)
 
-    xlsx_buf = io.BytesIO()
-    wb.save(xlsx_buf)
-    xlsx_buf.seek(0)
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
 
-    # CSV utf-8-sig for Excel
-    csv_buf = io.StringIO()
-    writer = csv.writer(csv_buf)
-    writer.writerow(headers)
-    for row in rows:
-        writer.writerow([
-            row["id"], row["batch_id"], parse_iso_to_local_text(row["tx_at"]),
-            "Kirim" if row["tx_type"] == "income" else "Chiqim",
-            row["amount_original"], row["currency"], row["amount_uzs"],
-            row["description"], row["category"], row["counterparty"], row["author"],
-            row["sign"], row["source_line"],
-        ])
-    csv_bytes = io.BytesIO(csv_buf.getvalue().encode("utf-8-sig"))
-    csv_bytes.seek(0)
-
-    # TXT
-    txt_lines = ["Moliya hisobot export", "=" * 40, ""]
-    for row in rows:
-        txt_lines.extend([
-            f"ID: {row['id']}",
-            f"Sana: {parse_iso_to_local_text(row['tx_at'])}",
-            f"Turi: {'Kirim' if row['tx_type'] == 'income' else 'Chiqim'}",
-            f"Summa: {money_fmt(row['amount_uzs'])} ({row['amount_original']} {row['currency']})",
-            f"Izoh: {row['description']}",
-            f"Kategoriya: {row['category']}",
-            f"Kontragent: {row['counterparty'] or '-'}",
-            f"Muallif: {row['author'] or '-'}",
-            f"Asl satr: {row['source_line']}",
-            "-" * 40,
-        ])
-    txt_bytes = io.BytesIO("\n".join(txt_lines).encode("utf-8"))
-    txt_bytes.seek(0)
-    return xlsx_buf, csv_bytes, txt_bytes
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("FINANCE HISOBOT\n\n")
+        for row in rows:
+            f.write(
+                f"#{row[0]} | {display_dt(row[1])} | {row[2]} | {money_fmt_uzs(row[3])} | {row[7]} | {row[8]}\n"
+            )
+    return xlsx_path, csv_path, txt_path
 
 
-async def fetch_cbu_usd_rate() -> Dict[str, str]:
-    timeout = aiohttp.ClientTimeout(total=20)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(CBU_USD_API) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-    if not isinstance(data, list) or not data:
-        raise ValueError("API bo'sh javob qaytardi")
-    row = data[0]
-    rate = str(row.get("Rate", "")).replace(",", ".").strip()
-    if not rate:
-        raise ValueError("Rate topilmadi")
-    return {
-        "rate": rate,
-        "date": str(row.get("Date", "")).strip(),
-        "ccy": str(row.get("Ccy", "USD")).strip(),
-        "name": str(row.get("CcyNm_UZ", "AQSH dollari")).strip(),
-    }
+def main_kb() -> ReplyKeyboardMarkup:
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    if WEB_APP_URL:
+        kb.add(KeyboardButton("🧾 Web App", web_app=WebAppInfo(url=WEB_APP_URL)))
+    kb.row("📊 Bugun", "📅 Haftalik", "🗓 Oylik")
+    kb.row("📈 Live", "🔄 Yangilash", "↩️ Undo")
+    kb.row("💱 Kursni belgilash", "📄 Records", "📤 Export")
+    kb.row("📝 Text hisobot", "📚 Kategoriyalar")
+    return kb
 
 
-# ---------------------------------------------------------
-# Handlers
-# ---------------------------------------------------------
-@dp.message_handler(commands=["start", "help"])
-async def cmd_start(message: types.Message) -> None:
-    text = (
-        "<b>Moliya bot tayyor.</b>\n\n"
-        "Matn yozing yoki Telegram export satrini yuboring.\n"
-        "Misollar:\n"
-        "• <code>+250$+517 ming azam aka labo berari olindi</code>\n"
-        "• <code>100 ming temir dostavkaga berdim</code>\n"
-        "• <code>[27.03.2026 12:01] Ali: +250$ + 300 ming olindi</code>\n\n"
-        "Qoidalar:\n"
-        "• <b>+</b> = kirim\n"
-        "• <b>-</b> yoki belgisiz = chiqim\n"
-        "• <b>mln</b> = million\n"
-        "• <b>ming</b> / <b>k</b> = ming\n"
-        "• <b>$</b> / <b>usd</b> = dollar kurs bo'yicha so'mga o'tadi"
+def save_confirm_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Saqlash", callback_data="pending:save"),
+        InlineKeyboardButton("❌ Bekor qilish", callback_data="pending:cancel"),
     )
-    await message.answer(text, reply_markup=main_keyboard())
+    return kb
+
+
+def refresh_confirm_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Ha, nolga tushir", callback_data="refresh:confirm"),
+        InlineKeyboardButton("❌ Yo‘q", callback_data="refresh:cancel"),
+    )
+    return kb
+
+
+def rate_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🌐 API orqali olish", callback_data="rate:api"),
+        InlineKeyboardButton("⌨️ Qo‘lda kiritish", callback_data="rate:manual"),
+    )
+    kb.add(InlineKeyboardButton("❌ Bekor", callback_data="rate:cancel"))
+    return kb
+
+
+def rate_confirm_kb(rate: str, source: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Saqlash", callback_data=f"rate:save:{rate}:{source}"),
+        InlineKeyboardButton("❌ Bekor", callback_data="rate:cancel"),
+    )
+    return kb
+
+
+async def send_period_report(message: types.Message, period: str, title: str) -> None:
+    totals = await fetch_totals(period)
+    lines = [
+        f"<b>{title}</b>",
+        f"Boshlanish: {display_dt(totals['start'])}",
+        f"Yozuvlar: {totals['count']} ta",
+        f"Kirim: {money_fmt_uzs(totals['income'])}",
+        f"Chiqim: {money_fmt_uzs(totals['expense'])}",
+        f"Qoldiq: {money_fmt_uzs(totals['net'])}",
+    ]
+    recs = await recent_records(8, period_start=totals["start"])
+    if recs:
+        lines.append("")
+        lines.append("<b>So‘nggi yozuvlar:</b>")
+        for x in recs:
+            sign = "+" if x["tx_type"] == "income" else "-"
+            lines.append(
+                f"#{x['id']} {display_dt(x['tx_at'])} | {sign}{money_fmt_uzs(x['amount_uzs'])} | {x['description']}"
+            )
+    await message.answer("\n".join(lines), reply_markup=main_kb())
+
+
+@dp.message_handler(commands=["start"])
+async def cmd_start(message: types.Message):
+    if not await is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "Assalomu alaykum. Bot tayyor. Oddiy matn, Telegram export yoki Web App orqali yozuv yuborishingiz mumkin.\n\n"
+        "Misol: <code>+250$+517 ming azam aka labo berari olindi</code>",
+        reply_markup=main_kb(),
+    )
 
 
 @dp.message_handler(commands=["rate"])
-async def cmd_rate(message: types.Message) -> None:
+async def cmd_rate(message: types.Message):
     if not await is_admin(message.from_user.id):
         return
     args = (message.get_args() or "").strip()
     if not args:
         rate = await get_usd_rate()
-        source = await get_setting("usd_rate_source", "default")
-        updated_at = await get_setting("usd_rate_updated_at", "-")
         await message.answer(
-            f"💱 Joriy USD kursi: <b>{money_fmt(rate)}</b>\nManba: {source}\nYangilangan: {parse_iso_to_local_text(updated_at)}",
-            reply_markup=main_keyboard(),
+            f"Joriy USD kursi: <b>{money_fmt_decimal(rate)}</b>\n"
+            f"Qo‘lda o‘rnatish: <code>/rate 12750</code>",
+            reply_markup=main_kb(),
         )
         return
     try:
-        cleaned = args.replace(" ", "")
-        if "," in cleaned and "." not in cleaned:
-            cleaned = cleaned.replace(",", "")
-        value = Decimal(cleaned)
-        if value <= 0:
+        val = clean_number(args)
+        if val <= 0:
             raise ValueError
     except Exception:
-        await message.answer("❌ Noto'g'ri format. Misol: <code>/rate 12750</code>")
+        await message.answer("Format xato. Misol: <code>/rate 12750</code>")
         return
-    await set_usd_rate(value, "manual_command")
-    await message.answer(f"✅ USD kurs saqlandi: <b>{money_fmt(value)}</b>", reply_markup=main_keyboard())
-
-
-@dp.message_handler(lambda m: m.text == "💱 Kursni belgilash")
-async def rate_menu_handler(message: types.Message) -> None:
-    if not await is_admin(message.from_user.id):
-        return
-    rate = await get_usd_rate()
-    source = await get_setting("usd_rate_source", "default")
-    updated = await get_setting("usd_rate_updated_at", "-")
-    text = (
-        f"<b>USD kursini belgilash</b>\n"
-        f"Joriy kurs: <b>{money_fmt(rate)}</b>\n"
-        f"Manba: {source}\n"
-        f"Yangilangan: {parse_iso_to_local_text(updated)}\n\n"
-        f"Tanlang:\n"
-        f"• API orqali avtomatik olish\n"
-        f"• Qo'lda kiritish\n\n"
-        f"Qo'lda kiritish formatlari:\n"
-        f"<code>12750</code> yoki <code>12,750</code>"
-    )
-    await message.answer(text, reply_markup=rate_menu_keyboard())
-
-
-@dp.callback_query_handler(lambda c: c.data == "rate:api_fetch")
-async def cb_rate_api_fetch(call: CallbackQuery) -> None:
-    if not await is_admin(call.from_user.id):
-        await call.answer("Ruxsat yo'q", show_alert=True)
-        return
-    try:
-        info = await fetch_cbu_usd_rate()
-        await call.message.edit_text(
-            f"🌐 API kursi topildi\n"
-            f"Valyuta: {info['name']} ({info['ccy']})\n"
-            f"Kurs: <b>{info['rate']}</b>\n"
-            f"Sana: {info['date']}\n\n"
-            f"Shu kursni saqlaysizmi?",
-            reply_markup=rate_confirm_keyboard(info["rate"], "api"),
-        )
-        await call.answer()
-    except Exception as e:
-        await call.answer("API xato", show_alert=True)
-        await call.message.answer(f"❌ API orqali kurs olinmadi: {e}")
-
-
-@dp.callback_query_handler(lambda c: c.data == "rate:manual_start")
-async def cb_rate_manual_start(call: CallbackQuery) -> None:
-    if not await is_admin(call.from_user.id):
-        await call.answer("Ruxsat yo'q", show_alert=True)
-        return
-    await RateStates.waiting_manual_rate.set()
-    await call.answer()
-    await call.message.answer(
-        "⌨️ Yangi USD kursini yuboring.\n\n"
-        "To'g'ri formatlar:\n"
-        "• <code>12750</code>\n"
-        "• <code>12,750</code>\n"
-        "• <code>12750.50</code>"
-    )
-
-
-@dp.message_handler(state=RateStates.waiting_manual_rate, content_types=types.ContentType.TEXT)
-async def state_rate_manual(message: types.Message, state: FSMContext) -> None:
-    if not await is_admin(message.from_user.id):
-        await state.finish()
-        return
-    raw = (message.text or "").replace(" ", "").strip()
-    try:
-        if "," in raw and "." not in raw:
-            raw = raw.replace(",", "")
-        value = Decimal(raw)
-        if value <= 0:
-            raise InvalidOperation
-    except Exception:
-        await message.answer(
-            "❌ Noto'g'ri format.\nMisollar:\n<code>12750</code>\n<code>12,750</code>\n<code>12750.50</code>"
-        )
-        return
-    await state.finish()
-    await message.answer(
-        f"💱 Kiritilgan kurs: <b>{money_fmt(value)}</b>\n\nSaqlaysizmi?",
-        reply_markup=rate_confirm_keyboard(str(value), "manual"),
-    )
-
-
-@dp.callback_query_handler(lambda c: c.data.startswith("rate:save:"))
-async def cb_rate_save(call: CallbackQuery) -> None:
-    if not await is_admin(call.from_user.id):
-        await call.answer("Ruxsat yo'q", show_alert=True)
-        return
-    try:
-        _, _, value, source = call.data.split(":", 3)
-        amount = Decimal(value)
-        await set_usd_rate(amount, source)
-        await call.message.edit_text(f"✅ USD kurs saqlandi: <b>{money_fmt(amount)}</b>\nManba: {source}")
-        await call.answer("Saqlandi")
-    except Exception as e:
-        await call.answer("Saqlashda xato", show_alert=True)
-        await call.message.answer(f"❌ Xato: {e}")
-
-
-@dp.callback_query_handler(lambda c: c.data == "rate:cancel", state="*")
-async def cb_rate_cancel(call: CallbackQuery, state: FSMContext) -> None:
-    await state.finish()
-    with suppress(Exception):
-        await call.message.edit_reply_markup(reply_markup=None)
-    await call.answer("Bekor qilindi")
-
-
-@dp.message_handler(lambda m: m.text == "🔄 Yangilash")
-async def ask_reset_live(message: types.Message) -> None:
-    if not await is_admin(message.from_user.id):
-        return
-    await message.answer(
-        "Bugungi live hisob 0 dan boshlansinmi?\nEski arxiv o'chmaydi va bazada saqlanadi.",
-        reply_markup=confirm_reset_keyboard(),
-    )
-
-
-@dp.callback_query_handler(lambda c: c.data == "reset:confirm")
-async def cb_reset_confirm(call: CallbackQuery) -> None:
-    if not await is_admin(call.from_user.id):
-        await call.answer("Ruxsat yo'q", show_alert=True)
-        return
-    await reset_live_period()
-    await call.answer("Yangilandi")
-    await call.message.edit_text(
-        f"✅ Live hisob yangilandi.\nYangi start: <b>{fmt_dt(now_local())}</b>\nEski yozuvlar arxivda saqlanadi."
-    )
-
-
-@dp.callback_query_handler(lambda c: c.data == "reset:cancel")
-async def cb_reset_cancel(call: CallbackQuery) -> None:
-    await call.answer("Bekor qilindi")
-    with suppress(Exception):
-        await call.message.edit_text("❌ Yangilash bekor qilindi.")
-
-
-@dp.message_handler(lambda m: m.text == "↩️ Oxirgi amalni bekor qilish")
-async def btn_undo(message: types.Message) -> None:
-    if not await is_admin(message.from_user.id):
-        return
-    res = await undo_last_batch()
-    if not res:
-        await message.answer("Oxirgi amal topilmadi.")
-        return
-    batch_id, count = res
-    await message.answer(f"✅ Bekor qilindi. Batch ID: <b>{batch_id}</b>, yozuvlar: <b>{count}</b>")
+    await set_setting("usd_rate", money_fmt_decimal(val))
+    await set_setting("usd_rate_source", "manual")
+    await set_setting("usd_rate_updated_at", now_iso())
+    await message.answer(f"✅ Yangi USD kurs saqlandi: <b>{money_fmt_decimal(val)}</b>")
 
 
 @dp.message_handler(commands=["undo"])
-async def cmd_undo(message: types.Message) -> None:
-    await btn_undo(message)
-
-
-@dp.message_handler(lambda m: m.text == "📊 Bugun")
-async def btn_today(message: types.Message) -> None:
-    reset_at = await get_live_reset_at()
-    start_dt = max(start_of_day(), reset_at)
-    data = await fetch_period_summary(start_dt)
-    title = "📊 Bugungi live hisobot"
-    await message.answer(build_report_text(title, data), reply_markup=main_keyboard())
-
-
-@dp.message_handler(lambda m: m.text == "📅 Haftalik")
-async def btn_week(message: types.Message) -> None:
-    data = await fetch_period_summary(start_of_week())
-    await message.answer(build_report_text("📅 Haftalik hisobot", data), reply_markup=main_keyboard())
-
-
-@dp.message_handler(lambda m: m.text == "🗓 Oylik")
-async def btn_month(message: types.Message) -> None:
-    data = await fetch_period_summary(start_of_month())
-    await message.answer(build_report_text("🗓 Oylik hisobot", data), reply_markup=main_keyboard())
-
-
-@dp.message_handler(lambda m: m.text == "📝 Text hisobot")
-async def btn_text_report(message: types.Message) -> None:
-    today_live = await fetch_period_summary(max(start_of_day(), await get_live_reset_at()))
-    week = await fetch_period_summary(start_of_week())
-    month = await fetch_period_summary(start_of_month())
-    text = "\n\n".join([
-        build_report_text("📊 Bugun", today_live),
-        build_report_text("📅 Haftalik", week),
-        build_report_text("🗓 Oylik", month),
-    ])
-    for chunk in [text[i:i+3500] for i in range(0, len(text), 3500)]:
-        await message.answer(chunk, reply_markup=main_keyboard())
-
-
-@dp.message_handler(lambda m: m.text == "📚 Arxiv")
-async def btn_archive(message: types.Message) -> None:
-    rows = await get_recent_transactions(15)
-    if not rows:
-        await message.answer("Arxiv bo'sh.")
+async def cmd_undo(message: types.Message):
+    if not await is_admin(message.from_user.id):
         return
-    lines = ["<b>Oxirgi arxiv yozuvlari</b>"]
-    for row in rows:
-        emo = "🟢" if row["tx_type"] == "income" else "🔴"
-        lines.append(
-            f"{emo} ID {row['id']} | {parse_iso_to_local_text(row['tx_at'])} | {money_fmt(row['amount_uzs'])} | {row['description']}"
-        )
-    await message.answer("\n".join(lines), reply_markup=main_keyboard())
-
-
-@dp.message_handler(lambda m: m.text == "📤 Export")
-async def btn_export(message: types.Message) -> None:
-    rows = await export_rows()
-    if not rows:
-        await message.answer("Export uchun yozuvlar yo'q.")
+    batch_id = await undo_last_batch(message.from_user.id)
+    if batch_id is None:
+        await message.answer("Bekor qilinadigan oxirgi amal topilmadi.")
         return
-    xlsx_buf, csv_buf, txt_buf = await create_export_files(rows)
-    stamp = now_local().strftime("%Y%m%d_%H%M")
-    await message.answer("Fayllar tayyor. Excel ochilmasa CSV yoki TXT dan foydalaning.")
-    await bot.send_document(message.chat.id, InputFile(xlsx_buf, filename=f"hisobot_{stamp}.xlsx"))
-    await bot.send_document(message.chat.id, InputFile(csv_buf, filename=f"hisobot_{stamp}.csv"))
-    await bot.send_document(message.chat.id, InputFile(txt_buf, filename=f"hisobot_{stamp}.txt"))
+    await message.answer(f"↩️ Batch bekor qilindi: #{batch_id}", reply_markup=main_kb())
 
 
 @dp.message_handler(commands=["records"])
-async def cmd_records(message: types.Message) -> None:
-    args = (message.get_args() or "10").strip()
-    try:
-        limit = max(1, min(50, int(args)))
-    except Exception:
-        limit = 10
-    rows = await get_recent_transactions(limit)
-    if not rows:
-        await message.answer("Yozuvlar topilmadi.")
+async def cmd_records(message: types.Message):
+    if not await is_admin(message.from_user.id):
         return
-    lines = [f"<b>Oxirgi {len(rows)} yozuv</b>"]
-    for row in rows:
-        emo = "🟢" if row["tx_type"] == "income" else "🔴"
-        lines.append(
-            f"{emo} ID {row['id']} | {parse_iso_to_local_text(row['tx_at'])} | {money_fmt(row['amount_uzs'])} | {row['description']}"
+    args = (message.get_args() or "").strip()
+    limit = 10
+    if args.isdigit():
+        limit = max(1, min(50, int(args)))
+    rows = await recent_records(limit)
+    if not rows:
+        await message.answer("Hozircha yozuv yo‘q.")
+        return
+    text = ["<b>So‘nggi yozuvlar</b>"]
+    for x in rows:
+        sign = "+" if x["tx_type"] == "income" else "-"
+        text.append(
+            f"#{x['id']} | {display_dt(x['tx_at'])}\n"
+            f"{sign}{money_fmt_uzs(x['amount_uzs'])} | {x['description']}\n"
+            f"Kategoriya: {x['category']} | Kontragent: {x['counterparty'] or '-'}"
         )
-    await message.answer("\n".join(lines))
+    await message.answer("\n\n".join(text), reply_markup=main_kb())
 
 
 @dp.message_handler(commands=["delete"])
-async def cmd_delete(message: types.Message) -> None:
+async def cmd_delete(message: types.Message):
     if not await is_admin(message.from_user.id):
         return
-    arg = (message.get_args() or "").strip()
-    if not arg.isdigit():
-        await message.answer("Misol: <code>/delete 15</code>")
+    args = (message.get_args() or "").strip()
+    if args.isdigit():
+        ok = await delete_record(int(args))
+        await message.answer("✅ O‘chirildi" if ok else "Topilmadi", reply_markup=main_kb())
         return
-    tx_id = int(arg)
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT id FROM transactions WHERE id = ? AND is_deleted = 0", (tx_id,))
-        row = await cur.fetchone()
-        if not row:
-            await message.answer("Topilmadi yoki allaqachon o'chirilgan.")
-            return
-        ts = now_local().isoformat()
-        await db.execute(
-            "UPDATE transactions SET is_deleted = 1, deleted_at = ?, deleted_reason = 'manual_delete' WHERE id = ?",
-            (ts, tx_id),
+    await DeleteStates.waiting_record_id.set()
+    await message.answer("O‘chiriladigan yozuv ID sini yuboring. Masalan: <code>123</code>")
+
+
+@dp.message_handler(state=DeleteStates.waiting_record_id, content_types=types.ContentType.TEXT)
+async def state_delete_record(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text.isdigit():
+        await message.answer("Faqat ID yuboring. Masalan: <code>123</code>")
+        return
+    ok = await delete_record(int(text))
+    await state.finish()
+    await message.answer("✅ O‘chirildi" if ok else "Topilmadi", reply_markup=main_kb())
+
+
+@dp.message_handler(lambda m: m.text == "📊 Bugun")
+async def btn_today(message: types.Message):
+    await send_period_report(message, "today", "Bugungi hisobot")
+
+
+@dp.message_handler(lambda m: m.text == "📅 Haftalik")
+async def btn_week(message: types.Message):
+    await send_period_report(message, "week", "Haftalik hisobot")
+
+
+@dp.message_handler(lambda m: m.text == "🗓 Oylik")
+async def btn_month(message: types.Message):
+    await send_period_report(message, "month", "Oylik hisobot")
+
+
+@dp.message_handler(lambda m: m.text == "📈 Live")
+async def btn_live(message: types.Message):
+    await send_period_report(message, "live", "Live hisobot")
+
+
+@dp.message_handler(lambda m: m.text == "↩️ Undo")
+async def btn_undo(message: types.Message):
+    await cmd_undo(message)
+
+
+@dp.message_handler(lambda m: m.text == "🔄 Yangilash")
+async def btn_refresh(message: types.Message):
+    await message.answer(
+        "Joriy live hisob 0 dan boshlansinmi? Eski arxiv saqlanib qoladi.",
+        reply_markup=refresh_confirm_kb(),
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("refresh:"))
+async def callback_refresh(call: CallbackQuery):
+    if call.data == "refresh:cancel":
+        await call.answer("Bekor qilindi")
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    ts = await reset_current_period()
+    await call.answer("Yangilandi")
+    await call.message.edit_text(
+        f"✅ Live hisob yangilandi. Yangi boshlanish: <b>{display_dt(ts)}</b>",
+        reply_markup=None,
+    )
+
+
+@dp.message_handler(lambda m: m.text == "💱 Kursni belgilash")
+async def btn_rate(message: types.Message):
+    rate = await get_usd_rate()
+    src = await get_setting("usd_rate_source", "default")
+    updated = await get_setting("usd_rate_updated_at", "-")
+    await message.answer(
+        f"<b>USD kurs sozlamasi</b>\n"
+        f"Joriy kurs: {money_fmt_decimal(rate)}\n"
+        f"Manba: {src}\n"
+        f"Yangilangan: {display_dt(updated) if updated != '-' else '-'}\n\n"
+        f"Tanlang:",
+        reply_markup=rate_menu_kb(),
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("rate:"), state="*")
+async def callback_rate(call: CallbackQuery, state: FSMContext):
+    data = call.data
+    if data == "rate:cancel":
+        await state.finish()
+        await call.answer("Bekor qilindi")
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    if data == "rate:manual":
+        await state.finish()
+        await RateStates.waiting_manual_rate.set()
+        await call.answer()
+        await call.message.answer(
+            "Yangi kursni yuboring.\nMisollar:\n<code>12750</code>\n<code>12,750</code>\n<code>12750.5</code>"
         )
-        await db.commit()
-    await message.answer(f"✅ O'chirildi: ID <b>{tx_id}</b>")
-
-
-@dp.message_handler(commands=["stats"])
-async def cmd_stats(message: types.Message) -> None:
-    args = (message.get_args() or "today").strip().lower()
-    if args in {"today", "bugun"}:
-        await btn_today(message)
-    elif args in {"week", "hafta", "weekly"}:
-        await btn_week(message)
-    elif args in {"month", "oy", "monthly"}:
-        await btn_month(message)
-    else:
-        await message.answer("Variantlar: <code>/stats today</code>, <code>/stats week</code>, <code>/stats month</code>")
-
-
-@dp.message_handler(content_types=types.ContentType.TEXT)
-async def parse_any_text(message: types.Message) -> None:
-    text = strip_command_prefix(message.text or "")
-    if not text:
         return
-
-    ignored_buttons = {
-        "📊 Bugun", "📅 Haftalik", "🗓 Oylik", "💱 Kursni belgilash",
-        "📤 Export", "📝 Text hisobot", "↩️ Oxirgi amalni bekor qilish",
-        "🔄 Yangilash", "📚 Arxiv"
-    }
-    if text in ignored_buttons:
-        return
-
-    usd_rate = await get_usd_rate()
-    rows = parse_input_lines(text)
-    items: List[ParsedItem] = []
-    for row in rows:
-        items.extend(
-            await parse_transactions_from_text(
-                row["text"] or "",
-                usd_rate=usd_rate,
-                author=row["author"] or sanitize_text(message.from_user.full_name or ""),
-                source_dt=row["dt"],
-                raw_line=row["source_line"] or row["text"] or "",
+    if data == "rate:api":
+        try:
+            rate, dt = await fetch_cbu_usd_rate()
+            await call.answer()
+            await call.message.edit_text(
+                f"CBU API orqali topildi:\nKurs: <b>{money_fmt_decimal(rate)}</b>\nSana: {dt}\n\nShu kursni saqlaysizmi?",
+                reply_markup=rate_confirm_kb(money_fmt_decimal(rate), "api"),
             )
-        )
+        except Exception as e:
+            await call.answer("API xato", show_alert=True)
+            await call.message.answer(f"API dan olishda xato: {e}")
+        return
+    if data.startswith("rate:save:"):
+        _, _, rate_value, source = data.split(":", 3)
+        await set_setting("usd_rate", rate_value)
+        await set_setting("usd_rate_source", source)
+        await set_setting("usd_rate_updated_at", now_iso())
+        await call.answer("Saqlandi")
+        await call.message.edit_text(f"✅ USD kurs saqlandi: <b>{rate_value}</b> | Manba: {source}")
 
+
+@dp.message_handler(state=RateStates.waiting_manual_rate, content_types=types.ContentType.TEXT)
+async def state_rate_manual(message: types.Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    try:
+        val = clean_number(raw)
+        if val <= 0:
+            raise ValueError
+    except Exception:
+        await message.answer("Format xato. Misol: <code>12750</code>")
+        return
+    await state.finish()
+    await message.answer(
+        f"Kiritilgan kurs: <b>{money_fmt_decimal(val)}</b>\nSaqlaymizmi?",
+        reply_markup=rate_confirm_kb(money_fmt_decimal(val), "manual"),
+    )
+
+
+@dp.message_handler(lambda m: m.text == "📄 Records")
+async def btn_records(message: types.Message):
+    await cmd_records(message)
+
+
+@dp.message_handler(lambda m: m.text == "📚 Kategoriyalar")
+async def btn_categories(message: types.Message):
+    cats = await get_category_summary("month")
+    if not cats:
+        await message.answer("Kategoriya bo‘yicha ma’lumot yo‘q.")
+        return
+    lines = ["<b>Oylik kategoriyalar</b>"]
+    for name, total in cats[:20]:
+        lines.append(f"• {name}: {money_fmt_uzs(total)}")
+    await message.answer("\n".join(lines), reply_markup=main_kb())
+
+
+@dp.message_handler(lambda m: m.text == "📝 Text hisobot")
+async def btn_text_report(message: types.Message):
+    today = await fetch_totals("today")
+    week = await fetch_totals("week")
+    month = await fetch_totals("month")
+    live = await fetch_totals("live")
+    text = (
+        f"<b>Text hisobot</b>\n\n"
+        f"Live: {money_fmt_uzs(live['net'])}\n"
+        f"Bugun: {money_fmt_uzs(today['net'])}\n"
+        f"Haftalik: {money_fmt_uzs(week['net'])}\n"
+        f"Oylik: {money_fmt_uzs(month['net'])}"
+    )
+    await message.answer(text, reply_markup=main_kb())
+
+
+@dp.message_handler(lambda m: m.text == "📤 Export")
+async def btn_export(message: types.Message):
+    xlsx_path, csv_path, txt_path = await export_files()
+    await message.answer("Export tayyor. Fayllar yuborilmoqda...")
+    await bot.send_document(message.chat.id, types.InputFile(xlsx_path), caption="Excel export")
+    await bot.send_document(message.chat.id, types.InputFile(csv_path), caption="CSV export")
+    await bot.send_document(message.chat.id, types.InputFile(txt_path), caption="Text export")
+
+
+@dp.message_handler(content_types=types.ContentType.WEB_APP_DATA)
+async def handle_web_app_data(message: types.Message, state: FSMContext):
+    try:
+        payload = json.loads(message.web_app_data.data)
+    except Exception:
+        await message.answer("Web App dan noto‘g‘ri JSON keldi.")
+        return
+    raw_text = (payload.get("text") or "").strip()
+    note = (payload.get("note") or "").strip()
+    source = (payload.get("source") or "mini_app").strip()
+    if note:
+        raw_text = f"{raw_text} | {note}"
+    if not raw_text:
+        await message.answer("Web App matni bo‘sh.")
+        return
+    items = await parse_text_to_records(raw_text, message.from_user.full_name)
     if not items:
-        await message.answer(
-            "Summalar topilmadi.\n\n"
-            "Misollar:\n"
-            "<code>+250$+517 ming azam aka labo berari olindi</code>\n"
-            "<code>100 ming temir dostavkaga berdim</code>\n"
-            "<code>[27.03.2026 12:01] Ali: +250$ + 300 ming olindi</code>",
-            reply_markup=main_keyboard(),
-        )
+        await message.answer("Summalar topilmadi. Misol: <code>+250$+517 ming azam aka labo berari olindi</code>")
         return
+    for x in items:
+        x.source_kind = source or "mini_app"
+    preview = await build_preview_text(items, raw_text)
+    pending = PendingBatch(
+        owner_id=message.from_user.id,
+        source_text=raw_text,
+        created_at=now_iso(),
+        summary_text="",
+        items=items,
+    )
+    await state.update_data(pending=batch_to_dict(pending))
+    await message.answer(preview, reply_markup=save_confirm_kb())
 
-    token = secrets.token_hex(8)
-    preview = build_preview_text(items, usd_rate)
-    PENDING_BATCHES[token] = {
-        "items": items,
-        "source_text": text,
-        "summary_text": preview,
-        "user_id": message.from_user.id,
-        "created_at": now_local().isoformat(),
-    }
-    await message.answer(preview, reply_markup=pending_keyboard(token))
 
-
-@dp.callback_query_handler(lambda c: c.data.startswith("save:"))
-async def callback_save(call: CallbackQuery) -> None:
-    token = call.data.split(":", 1)[1]
-    pending = PENDING_BATCHES.get(token)
-    if not pending:
-        await call.answer("Session topilmadi yoki eskirdi", show_alert=True)
+@dp.callback_query_handler(lambda c: c.data.startswith("pending:"), state="*")
+async def callback_pending(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    pending_raw = data.get("pending")
+    if not pending_raw:
+        await call.answer("Pending ma’lumot topilmadi", show_alert=True)
         return
-    if pending["user_id"] != call.from_user.id and not await is_admin(call.from_user.id):
-        await call.answer("Bu preview sizga tegishli emas", show_alert=True)
+    pending = dict_to_batch(pending_raw)
+    if call.data == "pending:cancel":
+        await state.update_data(pending=None)
+        await call.answer("Bekor qilindi")
+        await call.message.edit_reply_markup(reply_markup=None)
         return
     batch_id = await save_pending_batch(pending)
-    items: List[ParsedItem] = pending["items"]
-    income_total = sum(x.amount_uzs for x in items if x.tx_type == "income")
-    expense_total = sum(x.amount_uzs for x in items if x.tx_type == "expense")
-    text = (
-        f"✅ Saqlandi. Batch ID: <b>{batch_id}</b>\n"
-        f"🟢 Kirim: <b>{money_fmt(income_total)}</b>\n"
-        f"🔴 Chiqim: <b>{money_fmt(expense_total)}</b>\n"
-        f"⚖️ Qoldiq: <b>{money_fmt(income_total - expense_total)}</b>"
-    )
-    PENDING_BATCHES.pop(token, None)
-    with suppress(Exception):
-        await call.message.edit_text(text)
+    await state.update_data(pending=None)
     await call.answer("Saqlandi")
+    await call.message.edit_reply_markup(reply_markup=None)
+    summary, income, expense, net = summarize_records(pending.items)
+    await call.message.answer(
+        f"✅ Saqlandi. Batch #{batch_id}\n{summary}",
+        reply_markup=main_kb(),
+    )
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith("cancel:"))
-async def callback_cancel(call: CallbackQuery) -> None:
-    token = call.data.split(":", 1)[1]
-    PENDING_BATCHES.pop(token, None)
-    with suppress(Exception):
-        await call.message.edit_text("❌ Saqlash bekor qilindi.")
-    await call.answer("Bekor qilindi")
+@dp.message_handler(content_types=types.ContentType.TEXT, state="*")
+async def handle_text(message: types.Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+    if not text:
+        return
+    handled = {
+        "📊 Bugun", "📅 Haftalik", "🗓 Oylik", "📈 Live", "🔄 Yangilash", "↩️ Undo",
+        "💱 Kursni belgilash", "📄 Records", "📤 Export", "📝 Text hisobot", "📚 Kategoriyalar",
+    }
+    if text in handled:
+        return
+    items = await parse_text_to_records(text, message.from_user.full_name)
+    if not items:
+        await message.answer(
+            "Summalar topilmadi.\nMisol: <code>+250$+517 ming azam aka labo berari olindi</code>",
+            reply_markup=main_kb(),
+        )
+        return
+    preview = await build_preview_text(items, text)
+    pending = PendingBatch(
+        owner_id=message.from_user.id,
+        source_text=text,
+        created_at=now_iso(),
+        summary_text="",
+        items=items,
+    )
+    await state.update_data(pending=batch_to_dict(pending))
+    await message.answer(preview, reply_markup=save_confirm_kb())
 
 
-# ---------------------------------------------------------
-# Main
-# ---------------------------------------------------------
+def batch_to_dict(batch: PendingBatch) -> Dict[str, Any]:
+    return {
+        "owner_id": batch.owner_id,
+        "source_text": batch.source_text,
+        "created_at": batch.created_at,
+        "summary_text": batch.summary_text,
+        "items": [x.__dict__ for x in batch.items],
+    }
+
+
+def dict_to_batch(data: Dict[str, Any]) -> PendingBatch:
+    return PendingBatch(
+        owner_id=int(data["owner_id"]),
+        source_text=str(data["source_text"]),
+        created_at=str(data["created_at"]),
+        summary_text=str(data.get("summary_text") or ""),
+        items=[ParsedRecord(**x) for x in data.get("items", [])],
+    )
+
+
 async def on_startup(_: Dispatcher) -> None:
     await init_db()
-    log.info("Bot ishga tushdi")
-
-
-async def main() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN topilmadi")
-    await on_startup(dp)
-    await dp.start_polling()
+    logger.info("Bot ishga tushdi")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
